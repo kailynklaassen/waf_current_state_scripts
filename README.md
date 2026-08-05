@@ -70,6 +70,10 @@ Rules applied consistently across all pillars:
   threshold.
 - **A check that errors reports `open`** with the error text, rather than aborting the
   pillar or silently passing.
+- **Unreadable evidence never scores `completed`.** A check distinguishes "we looked and
+  found nothing" from "we could not look" — the latter is `open` with a rationale naming
+  the unreadable source. A permanent test enforces this, because reporting a control as
+  satisfied when it was never checked is the worst failure this tool could have.
 
 ### Questions that can't be automated
 
@@ -151,6 +155,7 @@ tools/
 tests/
   test_waf_core.py                scoring, scope SQL, report rendering (44 tests)
   test_notebooks.py               notebook structure and pillar coverage (26 tests)
+  test_greenfield.py              every check on an empty/locked-down workspace (8 tests)
 ```
 
 ## Results table and combining pillars
@@ -178,11 +183,12 @@ in-memory results for the current session only.
 ## Testing
 
 **Offline** — no workspace needed. Covers scoring thresholds, scope SQL generation
-(including quote escaping), report rendering, notebook structure, and that each pillar's
-checks match the published question bank exactly:
+(including quote escaping), report rendering, notebook structure, that each pillar's
+checks match the published question bank exactly, and that every check behaves on an
+empty or locked-down workspace without ever falsely reporting `completed`:
 
 ```bash
-python -m unittest discover -s tests -v     # 70 tests
+python -m unittest discover -s tests -v     # 78 tests
 python tools/nbutil.py validate             # notebook JSON, syntax, no committed output
 ```
 

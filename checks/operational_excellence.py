@@ -1140,6 +1140,21 @@ def oe_03_04(ctx: Ctx) -> Result:
 
 def oe_04_01(ctx: Ctx) -> Result:
     """Manage service limits and quotas."""
+    # "No pressure observed" only means something if the sources were readable.
+    # Otherwise absence of evidence would masquerade as evidence of absence.
+    sources = {
+        "system.access.audit": ctx.has_table("system.access.audit"),
+        "system.query.history": ctx.has_table("system.query.history"),
+        "system.compute.warehouse_events": ctx.has_table("system.compute.warehouse_events"),
+    }
+    if not any(sources.values()):
+        return Result(
+            "OE-04-01", "", "", "", STATUS_OPEN,
+            "None of the sources needed to detect quota pressure are readable "
+            "(system.access.audit, system.query.history, system.compute.warehouse_events), "
+            "so limits and quotas cannot be assessed.",
+            {"readable_sources": 0},
+        )
     throttles = 0
     if ctx.has_table("system.access.audit"):
         throttles = ctx.count_safe(
@@ -1170,14 +1185,16 @@ def oe_04_01(ctx: Ctx) -> Result:
             """
         )
     total_signals = throttles + queued + upsize_failures
+    readable = sum(1 for v in sources.values() if v)
     if total_signals == 0:
         return Result(
             "OE-04-01", "", "", "", STATUS_COMPLETED,
             f"No quota errors, capacity queuing, or scale-up failures observed in the "
-            f"last {ctx.lookback_days} days, so current limits are not constraining "
-            "workloads. Note this shows headroom today, not that limits are documented "
-            "and tracked.",
-            {"throttle_events": 0, "queued_queries": 0, "warehouse_failures": 0},
+            f"last {ctx.lookback_days} days across {readable} of {len(sources)} readable "
+            "source(s), so current limits are not constraining workloads. Note this shows "
+            "headroom today, not that limits are documented and tracked.",
+            {"throttle_events": 0, "queued_queries": 0, "warehouse_failures": 0,
+             "readable_sources": readable},
         )
     return Result(
         "OE-04-01", "", "", "", STATUS_IN_PROGRESS,

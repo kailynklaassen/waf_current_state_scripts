@@ -857,16 +857,29 @@ def co_03_04(ctx: Ctx) -> Result:
 
 def co_03_05(ctx: Ctx) -> Result:
     """Monitor and manage Delta Sharing egress costs."""
+    # Distinguish "no shares exist" from "we could not look" - only the former
+    # justifies calling this complete.
+    shares_readable = ctx.has_table("system.information_schema.shares")
     shares = 0
-    recipients = 0
-    if ctx.has_table("system.information_schema.shares"):
+    if shares_readable:
         shares = ctx.count_safe("SELECT count(*) AS n FROM system.information_schema.shares")
+    recipients = 0
+    recipients_readable = False
     w = ctx.w
     if w is not None:
         try:
             recipients = sum(1 for _ in w.recipients.list())
+            recipients_readable = True
         except Exception:
-            recipients = 0
+            recipients_readable = False
+
+    if not shares_readable and not recipients_readable:
+        return Result(
+            "CO-03-05", "", "", "", STATUS_OPEN,
+            "Neither the shares system table nor the recipients API is reachable, so "
+            "Delta Sharing egress cost cannot be assessed.",
+            {"shares_readable": False, "recipients_readable": False},
+        )
     if shares == 0 and recipients == 0:
         return Result(
             "CO-03-05", "", "", "", STATUS_COMPLETED,
