@@ -437,14 +437,13 @@ def dg_03_02(ctx: Ctx) -> Result:
             WHERE {scope.predicate('catalog_name', 'schema_name')}
             """
         )
-    expectations = 0
+    # Pipeline expectations are declared in pipeline source, which is not exposed in
+    # system tables. Declarative pipelines are the vehicle for expectations, so count
+    # them as a capability signal rather than claiming expectations were found.
+    pipelines = 0
     if ctx.has_table("system.lakeflow.pipelines"):
-        expectations = ctx.count(
-            """
-            SELECT count(*) AS n FROM system.lakeflow.pipelines
-            WHERE delete_time IS NULL
-              AND lower(coalesce(to_json(settings), '')) LIKE '%expect%'
-            """
+        pipelines = ctx.count_safe(
+            "SELECT count(*) AS n FROM system.lakeflow.pipelines WHERE delete_time IS NULL"
         )
     constrained = ctx.count(
         f"""
@@ -465,14 +464,17 @@ def dg_03_02(ctx: Ctx) -> Result:
         signals.append(f"{monitored} table(s) under Lakehouse Monitoring")
     if constrained:
         signals.append(f"{constrained} table(s) with declared constraints")
-    if expectations:
-        signals.append(f"{expectations} pipeline(s) declaring expectations")
+    if pipelines:
+        signals.append(
+            f"{pipelines} declarative pipeline(s) that can carry expectations "
+            "(expectation definitions live in pipeline source, not system tables)"
+        )
 
     if not signals:
         return Result(
             "DG-03-02", "", "", "", STATUS_OPEN,
-            "No Lakehouse Monitoring results, table constraints, or pipeline "
-            "expectations found, so no automated data quality tooling is in use.",
+            "No Lakehouse Monitoring results, table constraints, or declarative "
+            "pipelines found, so no automated data quality tooling is in use.",
             {"scoped": True},
         )
     return ratio_result(
@@ -483,7 +485,7 @@ def dg_03_02(ctx: Ctx) -> Result:
         complete_at=ctx.complete_at,
         extra="Signals found: " + "; ".join(signals) + ".",
         metrics={"monitored": monitored, "constrained": constrained,
-                 "pipelines_with_expectations": expectations, "scoped": True},
+                 "declarative_pipelines": pipelines, "scoped": True},
     )
 
 

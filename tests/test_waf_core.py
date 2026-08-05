@@ -247,6 +247,52 @@ class TestReporting(unittest.TestCase):
         self.assertEqual(json.loads(row["metrics_json"])["a"], 1)
 
 
+class TestCliCoercion(unittest.TestCase):
+    """The CLI harness must return Spark-like types, not raw JSON strings.
+
+    Regression guard: the CLI renders every column as a string, so a check doing
+    ``f"{row['n']:,}"`` raised "Cannot specify ',' with 's'" in the harness while
+    working fine on a cluster. Coercion keeps the two environments faithful.
+    """
+
+    def setUp(self):
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))), "tools"))
+        from smoke_test import _coerce  # noqa: PLC0415
+
+        self.coerce = _coerce
+
+    def test_ints(self):
+        self.assertEqual(self.coerce("42"), 42)
+        self.assertIsInstance(self.coerce("42"), int)
+        self.assertEqual(self.coerce("-7"), -7)
+
+    def test_floats(self):
+        self.assertAlmostEqual(self.coerce("3.5"), 3.5)
+        self.assertIsInstance(self.coerce("3.5"), float)
+
+    def test_bools(self):
+        self.assertIs(self.coerce("true"), True)
+        self.assertIs(self.coerce("false"), False)
+
+    def test_nulls_and_empty(self):
+        self.assertIsNone(self.coerce("null"))
+        self.assertIsNone(self.coerce(""))
+
+    def test_plain_strings_survive(self):
+        self.assertEqual(self.coerce("delta"), "delta")
+        self.assertEqual(self.coerce("prod_catalog"), "prod_catalog")
+
+    def test_non_strings_pass_through(self):
+        self.assertEqual(self.coerce(5), 5)
+        self.assertIsNone(self.coerce(None))
+        self.assertEqual(self.coerce({"a": 1}), {"a": 1})
+
+    def test_coerced_value_supports_thousands_format(self):
+        # The exact operation that failed before coercion.
+        self.assertEqual(f"{self.coerce('1234'):,}", "1,234")
+
+
 class TestQuestionCatalog(unittest.TestCase):
     def test_all_151_questions_present(self):
         self.assertEqual(len(wq.QUESTIONS), 151)

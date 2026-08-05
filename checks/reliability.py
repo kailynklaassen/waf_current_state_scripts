@@ -100,7 +100,7 @@ def r_01_02(ctx: Ctx) -> Result:
             SELECT count(DISTINCT usage_metadata.job_id) AS n
             FROM system.billing.usage
             WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
-              AND lower(coalesce(sku_name, '')) LIKE '%serverless%'
+              AND coalesce(product_features.is_serverless, lower(coalesce(sku_name, '')) LIKE '%serverless%')
               AND usage_metadata.job_id IS NOT NULL
             """
         )
@@ -279,7 +279,7 @@ def r_01_06(ctx: Ctx) -> Result:
         f"""
         SELECT
           sum(usage_quantity) AS total,
-          sum(CASE WHEN lower(coalesce(sku_name, '')) LIKE '%serverless%'
+          sum(CASE WHEN coalesce(product_features.is_serverless, lower(coalesce(sku_name, '')) LIKE '%serverless%')
                    THEN usage_quantity ELSE 0 END) AS serverless
         FROM system.billing.usage
         WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
@@ -474,14 +474,12 @@ def r_02_04(ctx: Ctx) -> Result:
         GROUP BY 1 ORDER BY 2 DESC
         """
     )
-    expectations = 0
+    # Expectation definitions live in pipeline source, not in system tables, so count
+    # declarative pipelines as the capability signal instead of inferring expectations.
+    pipelines = 0
     if ctx.has_table("system.lakeflow.pipelines"):
-        expectations = ctx.count(
-            """
-            SELECT count(*) AS n FROM system.lakeflow.pipelines
-            WHERE delete_time IS NULL
-              AND lower(coalesce(to_json(settings), '')) LIKE '%expect%'
-            """
+        pipelines = ctx.count_safe(
+            "SELECT count(*) AS n FROM system.lakeflow.pipelines WHERE delete_time IS NULL"
         )
     mix = ", ".join(f"{r['constraint_type']}={r['n']}" for r in kinds)
     return ratio_result(
@@ -494,13 +492,14 @@ def r_02_04(ctx: Ctx) -> Result:
         extra=(
             (f"Constraint mix: {mix}. " if mix else "No constraints declared. ")
             + (
-                f"{expectations} pipeline(s) declare data expectations."
-                if expectations
-                else "No pipeline expectations found."
+                f"{pipelines} declarative pipeline(s) present, which can enforce "
+                "expectations (definitions are in pipeline source, not system tables)."
+                if pipelines
+                else "No declarative pipelines found to carry expectations."
             )
         ),
         metrics={"constraint_mix": {r["constraint_type"]: r["n"] for r in kinds},
-                 "pipelines_with_expectations": expectations, "scoped": True},
+                 "declarative_pipelines": pipelines, "scoped": True},
     )
 
 
@@ -597,7 +596,7 @@ def r_03_01(ctx: Ctx) -> Result:
             SELECT count(DISTINCT usage_metadata.job_id) AS n
             FROM system.billing.usage
             WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
-              AND lower(coalesce(sku_name, '')) LIKE '%serverless%'
+              AND coalesce(product_features.is_serverless, lower(coalesce(sku_name, '')) LIKE '%serverless%')
               AND usage_metadata.job_id IS NOT NULL
             """
         )
@@ -674,13 +673,13 @@ def r_03_02(ctx: Ctx) -> Result:
 
 def r_04_01(ctx: Ctx) -> Result:
     """Recover from Structured Streaming query failures (checkpointing)."""
+    # settings.continuous marks a pipeline as always-on streaming.
     streaming_pipelines = 0
     if ctx.has_table("system.lakeflow.pipelines"):
-        streaming_pipelines = ctx.count(
+        streaming_pipelines = ctx.count_safe(
             """
             SELECT count(*) AS n FROM system.lakeflow.pipelines
-            WHERE delete_time IS NULL
-              AND lower(coalesce(pipeline_type, '')) NOT LIKE '%materialized%'
+            WHERE delete_time IS NULL AND settings.continuous = true
             """
         )
     streaming_queries = 0

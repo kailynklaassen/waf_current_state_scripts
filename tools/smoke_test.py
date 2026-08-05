@@ -37,6 +37,33 @@ PILLAR_MODULES = {
 }
 
 
+def _coerce(value):
+    """Convert CLI JSON scalars to the types Spark would return.
+
+    The CLI renders every column as a JSON string, whereas ``spark.sql`` returns
+    real ints/floats/bools. Without this, checks that format numbers (``f"{n:,}"``)
+    pass here and fail on a cluster - or worse, pass in both places while comparing
+    strings. Coercing keeps the harness faithful to production.
+    """
+    if not isinstance(value, str):
+        return value
+    if value == "":
+        return None
+    low = value.lower()
+    if low in ("true", "false"):
+        return low == "true"
+    if low == "null":
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
 class CliCtx(wc.Ctx):
     """A :class:`Ctx` whose SQL runs through the Databricks CLI instead of Spark."""
 
@@ -77,7 +104,7 @@ class CliCtx(wc.Ctx):
         except json.JSONDecodeError as exc:
             self.failures.append((one_line, f"unparseable output: {exc}"))
             raise
-        return rows
+        return [{k: _coerce(v) for k, v in row.items()} for row in rows]
 
     @property
     def w(self):
