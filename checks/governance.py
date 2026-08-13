@@ -82,45 +82,70 @@ def dg_01_02(ctx: Ctx) -> Result:
 
 
 def dg_01_03(ctx: Ctx) -> Result:
-    """Track data and AI lineage to drive visibility of the data."""
-    missing = ctx.require_tables("system.access.table_lineage")
-    if missing:
-        return Result(
-            "DG-01-03", "", "", "", STATUS_OPEN,
-            f"Cannot verify: {missing} is not readable in this workspace.",
-            {"scoped": True},
-        )
+    """Track data and AI lineage to drive visibility of the data.
+
+    Unity Catalog emits lineage automatically for every governed asset, so
+    "do you have lineage?" reduces to a structural question: is the table in
+    UC at all? Tables left in the legacy hive_metastore get no automatic
+    lineage. Scored as UC-managed coverage = UC tables / (UC + hive) tables.
+    """
     scope = ctx.scope
-    total = ctx.count(
+    uc_tables = ctx.count(
         f"""
         SELECT count(*) AS n FROM system.information_schema.tables
         WHERE {scope.predicate()} AND table_type <> 'VIEW'
         """
     )
-    with_lineage = ctx.count(
-        f"""
-        SELECT count(DISTINCT lower(concat_ws('.', target_table_catalog,
-                                              target_table_schema, target_table_name))) AS n
-        FROM system.access.table_lineage
-        WHERE event_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
-          AND target_table_name IS NOT NULL
-          AND {scope.predicate('target_table_catalog', 'target_table_schema')}
+    hive_tables = ctx.count_safe(
+        """
+        SELECT count(*) AS n FROM system.information_schema.tables
+        WHERE lower(table_catalog) = 'hive_metastore' AND table_type <> 'VIEW'
         """
     )
-    # Lineage can only be observed for tables that exist; cap to avoid >100%.
-    with_lineage = min(with_lineage, total) if total else with_lineage
+    total = uc_tables + hive_tables
+    # Is lineage itself being consumed? Direct queries against the lineage
+    # system tables show it is operationalized for governance, not just emitted.
+    queries = consumers = 0
+    if ctx.has_table("system.query.history"):
+        row = ctx.one(
+            f"""
+            SELECT count(*) AS queries, count(DISTINCT executed_by) AS consumers
+            FROM system.query.history
+            WHERE start_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
+              AND lower(statement_text) LIKE '%system.access.%lineage%'
+            """
+        )
+        queries = int(row.get("queries") or 0)
+        consumers = int(row.get("consumers") or 0)
+    consume_note = (
+        f" The lineage system tables are actively queried: {queries:,} query/queries "
+        f"by {consumers} principal(s) in the last {ctx.lookback_days} days."
+        if queries
+        else " No one queried the lineage system tables directly in the window, so "
+        "lineage is captured but not yet operationalized for governance."
+    )
+    hive_note = (
+        f"{hive_tables:,} table(s) remain in hive_metastore with no automatic lineage; "
+        "migrate them to UC to capture provenance."
+        if hive_tables
+        else "No tables remain in the legacy hive_metastore, so every table gets "
+        "automatic lineage."
+    )
     return ratio_result(
         "DG-01-03",
-        with_lineage,
+        uc_tables,
         total,
-        f"{scope.label} tables have lineage captured in the last {ctx.lookback_days} days",
+        f"{scope.label} tables are governed by Unity Catalog (and therefore get "
+        "automatic lineage) rather than stranded in the legacy hive_metastore",
         complete_at=ctx.complete_at,
         none_found=(
-            "No table lineage events recorded in the lookback window; lineage is not "
-            "being generated or no pipelines have run."
+            "No tables found in Unity Catalog or hive_metastore, so lineage coverage "
+            "cannot be assessed."
         ),
-        extra="Lineage is emitted automatically for UC assets touched by a query or job.",
-        metrics={"lookback_days": ctx.lookback_days, "scoped": True},
+        extra=hive_note + consume_note,
+        metrics={"hive_metastore_tables": hive_tables, "uc_tables": uc_tables,
+                 "lineage_queries": queries, "lineage_query_principals": consumers,
+                 "scoped": True},
     )
 
 

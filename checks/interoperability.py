@@ -727,32 +727,32 @@ def iu_04_02(ctx: Ctx) -> Result:
 
 
 def iu_04_03(ctx: Ctx) -> Result:
-    """Provide a central catalog for discovery and lineage."""
+    """Provide a central catalog for discovery and lineage.
+
+    A central catalog with provenance means the tables are governed by Unity
+    Catalog, which emits lineage automatically. The gap is tables stranded in
+    the legacy hive_metastore. Scored as UC tables / (UC + hive) tables.
+    """
     scope = ctx.scope
-    tables = ctx.count_safe(
+    uc_tables = ctx.count_safe(
         f"""
         SELECT count(*) AS n FROM system.information_schema.tables
         WHERE {scope.predicate()} AND table_type <> 'VIEW'
         """
     )
-    if tables == 0:
+    hive_tables = ctx.count_safe(
+        """
+        SELECT count(*) AS n FROM system.information_schema.tables
+        WHERE lower(table_catalog) = 'hive_metastore' AND table_type <> 'VIEW'
+        """
+    )
+    total = uc_tables + hive_tables
+    if total == 0:
         return Result(
             "IU-04-03", "", "", "", STATUS_OPEN,
-            "No tables found in the assessed catalogs, so central cataloging cannot be "
-            "assessed.",
+            "No tables found in Unity Catalog or hive_metastore, so central cataloging "
+            "cannot be assessed.",
             {"scoped": True},
-        )
-    lineage_tables = 0
-    if ctx.has_table("system.access.table_lineage"):
-        lineage_tables = ctx.count_safe(
-            f"""
-            SELECT count(DISTINCT lower(concat_ws('.', target_table_catalog,
-                                                  target_table_schema, target_table_name))) AS n
-            FROM system.access.table_lineage
-            WHERE event_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
-              AND target_table_name IS NOT NULL
-              AND {scope.predicate('target_table_catalog', 'target_table_schema')}
-            """
         )
     column_lineage = 0
     if ctx.has_table("system.access.column_lineage"):
@@ -762,27 +762,20 @@ def iu_04_03(ctx: Ctx) -> Result:
             WHERE event_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
             """
         )
-    hive_tables = ctx.count_safe(
-        """
-        SELECT count(*) AS n FROM system.information_schema.tables
-        WHERE lower(table_catalog) = 'hive_metastore'
-        """
-    )
-    lineage_tables = min(lineage_tables, tables)
     return ratio_result(
         "IU-04-03",
-        lineage_tables,
-        tables,
-        f"{scope.label} tables are in Unity Catalog with lineage captured in the last "
-        f"{ctx.lookback_days} days, making them discoverable with provenance",
+        uc_tables,
+        total,
+        f"{scope.label} tables are governed by Unity Catalog (a central catalog with "
+        "automatic lineage) rather than stranded in the legacy hive_metastore",
         complete_at=ctx.complete_at,
         none_found=(
-            f"{tables:,} table(s) are registered in Unity Catalog but no lineage events "
-            f"were recorded in the last {ctx.lookback_days} days, so provenance is not "
-            "being captured."
+            "No tables found in Unity Catalog or hive_metastore, so central cataloging "
+            "cannot be assessed."
         ),
         extra=(
-            f"{column_lineage:,} column-level lineage event(s) recorded."
+            f"{column_lineage:,} column-level lineage event(s) recorded in the last "
+            f"{ctx.lookback_days} days."
             + (
                 f" {hive_tables:,} table(s) remain outside UC in hive_metastore, so the "
                 "catalog is not fully central."
@@ -791,7 +784,8 @@ def iu_04_03(ctx: Ctx) -> Result:
             )
         ),
         metrics={"column_lineage_events": column_lineage,
-                 "hive_metastore_tables": hive_tables, "scoped": True},
+                 "hive_metastore_tables": hive_tables, "uc_tables": uc_tables,
+                 "scoped": True},
     )
 
 
