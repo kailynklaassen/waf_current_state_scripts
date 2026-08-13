@@ -103,8 +103,11 @@ def dg_01_03(ctx: Ctx) -> Result:
         """
     )
     total = uc_tables + hive_tables
-    # Is lineage itself being consumed? Direct queries against the lineage
-    # system tables show it is operationalized for governance, not just emitted.
+    # Is lineage operationalized for governance? Two escalating signals:
+    #   (1) ad-hoc queries against the lineage system tables, and
+    #   (2) persisted views/tables BUILT ON the lineage tables -- the strongest
+    #       signal, since mature teams stand up impact-analysis / orphaned-table
+    #       / PII-propagation assets on top of system.access.*lineage.
     queries = consumers = 0
     if ctx.has_table("system.query.history"):
         row = ctx.one(
@@ -117,13 +120,51 @@ def dg_01_03(ctx: Ctx) -> Result:
         )
         queries = int(row.get("queries") or 0)
         consumers = int(row.get("consumers") or 0)
-    consume_note = (
-        f" The lineage system tables are actively queried: {queries:,} query/queries "
-        f"by {consumers} principal(s) in the last {ctx.lookback_days} days."
-        if queries
-        else " No one queried the lineage system tables directly in the window, so "
-        "lineage is captured but not yet operationalized for governance."
+    # Views whose definition references the lineage system tables.
+    derived_views = ctx.count_safe(
+        """
+        SELECT count(*) AS n FROM system.information_schema.views
+        WHERE lower(view_definition) LIKE '%system.access.%lineage%'
+        """
     )
+    # Tables materialized from the lineage tables (they appear as a lineage
+    # target whose source is system.access.*lineage).
+    derived_tables = ctx.count_safe(
+        f"""
+        SELECT count(DISTINCT concat_ws('.', target_table_catalog,
+                                        target_table_schema, target_table_name)) AS n
+        FROM system.access.table_lineage
+        WHERE event_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+          AND lower(source_table_schema) = 'access'
+          AND lower(source_table_name) RLIKE 'lineage'
+          AND target_table_name IS NOT NULL
+    """
+    )
+    derived = derived_views + derived_tables
+    if derived:
+        consume_note = (
+            f" Lineage is operationalized for governance: {derived} persisted "
+            f"asset(s) ({derived_views} view(s), {derived_tables} table(s)) are built "
+            "directly on the lineage system tables, plus "
+            f"{queries:,} ad-hoc query/queries by {consumers} principal(s) in the last "
+            f"{ctx.lookback_days} days."
+        )
+    elif queries:
+        consume_note = (
+            f" The lineage system tables are actively queried ({queries:,} query/queries "
+            f"by {consumers} principal(s) in the last {ctx.lookback_days} days), but no "
+            "persisted views or tables are built on them yet -- standing up an "
+            "impact-analysis or orphaned-table asset on system.access.table_lineage "
+            "would embed lineage into the governance workflow."
+        )
+    else:
+        consume_note = (
+            " No queries, views or tables reference the lineage system tables in the "
+            "window. To use lineage for governance, build reports on "
+            "system.access.table_lineage / column_lineage (impact analysis, "
+            "orphaned-table detection, PII propagation) rather than only browsing the "
+            "Catalog Explorer graph."
+        )
     hive_note = (
         f"{hive_tables:,} table(s) remain in hive_metastore with no automatic lineage; "
         "migrate them to UC to capture provenance."
@@ -145,7 +186,8 @@ def dg_01_03(ctx: Ctx) -> Result:
         extra=hive_note + consume_note,
         metrics={"hive_metastore_tables": hive_tables, "uc_tables": uc_tables,
                  "lineage_queries": queries, "lineage_query_principals": consumers,
-                 "scoped": True},
+                 "lineage_derived_views": derived_views,
+                 "lineage_derived_tables": derived_tables, "scoped": True},
     )
 
 
