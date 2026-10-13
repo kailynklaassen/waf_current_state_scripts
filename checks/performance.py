@@ -922,13 +922,21 @@ def pe_03_03(ctx: Ctx) -> Result:
     """Identify bottlenecks."""
     if (bad := _has_query_history(ctx, "PE-03-03")) is not None:
         return bad
+    # A single query can hit several of these at once, so the per-category counts
+    # overlap. "unhealthy" is the distinct count of queries tripping ANY bottleneck
+    # (the union); taking max() of the categories would ignore problems outside the
+    # largest one and overstate health, while summing would double-count overlaps.
     row = ctx.one(
         f"""
         SELECT count(*) AS total,
                count_if(coalesce(spilled_local_bytes, 0) > 0) AS spilling,
                count_if(coalesce(shuffle_read_bytes, 0) > coalesce(read_bytes, 0)
                         AND coalesce(read_bytes, 0) > 0) AS shuffle_heavy,
-               count_if(coalesce(waiting_at_capacity_duration_ms, 0) > 0) AS queued
+               count_if(coalesce(waiting_at_capacity_duration_ms, 0) > 0) AS queued,
+               count_if(coalesce(spilled_local_bytes, 0) > 0
+                        OR (coalesce(shuffle_read_bytes, 0) > coalesce(read_bytes, 0)
+                            AND coalesce(read_bytes, 0) > 0)
+                        OR coalesce(waiting_at_capacity_duration_ms, 0) > 0) AS unhealthy
         FROM system.query.history
         WHERE start_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
           AND execution_status = 'FINISHED'
@@ -944,7 +952,8 @@ def pe_03_03(ctx: Ctx) -> Result:
     spilling = int(row.get("spilling") or 0)
     shuffle_heavy = int(row.get("shuffle_heavy") or 0)
     queued = int(row.get("queued") or 0)
-    healthy = total - max(spilling, shuffle_heavy, queued)
+    unhealthy = int(row.get("unhealthy") or 0)
+    healthy = total - unhealthy
     issues = []
     if spilling:
         issues.append(f"{spilling:,} spilling to disk (memory pressure)")
@@ -963,7 +972,7 @@ def pe_03_03(ctx: Ctx) -> Result:
             if issues
             else "No bottleneck signals detected in query telemetry."
         ),
-        metrics={"queries": total, "spilling": spilling,
+        metrics={"queries": total, "unhealthy": unhealthy, "spilling": spilling,
                  "shuffle_heavy": shuffle_heavy, "queued": queued},
     )
 
