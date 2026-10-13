@@ -1286,17 +1286,18 @@ def oe_04_01(ctx: Ctx) -> Result:
 
     Scored as resource-quota utilization: for each documented limit we can count, the
     denominator is the published limit and the numerator is current usage, giving a
-    utilization %. The status is the average utilization across all counted assets, and
-    is *inverse* - more consumed capacity is worse, because approaching a limit is what
-    needs action:
+    utilization %. Scoring is *inverse* - more consumed capacity is worse, because
+    approaching a limit is what needs action:
 
-        avg < 60%      -> completed    (ample headroom)
-        60% <= avg <80% -> in-progress  (monitor, plan increases)
-        avg >= 80%     -> open         (capacity action needed)
+        any single asset >= 80% of its limit  -> open         (capacity action needed)
+        else average >= 60%                    -> in-progress  (monitor, plan increases)
+        else                                   -> completed    (ample headroom)
 
-    Per-asset utilization is listed in the rationale; limits that cannot be counted from
-    telemetry are called out for manual confirmation. Limits are config-overridable
-    (``cfg["quota_limits"]``) because many are per-account defaults that can be raised.
+    The average is the headline, but one asset near its ceiling forces ``open`` on its
+    own - it can't be averaged away by many idle resources. Every assessed asset's % is
+    listed in the rationale (highest first) so it is clear what drives the status; limits
+    that cannot be counted are called out for manual confirmation. Limits are config-
+    overridable (``cfg["quota_limit_overrides"]``) because many are raisable defaults.
     """
     limits = dict(ctx.cfg.get("quota_limits") or DEFAULT_QUOTA_LIMITS)
     # Light-touch override: {asset_key: effective_limit} for limits you've had raised,
@@ -1336,39 +1337,54 @@ def oe_04_01(ctx: Ctx) -> Result:
         )
 
     avg = sum(f for *_, f in assessed) / len(assessed)
-    if avg >= open_at:
+    ranked = sorted(assessed, key=lambda t: t[3], reverse=True)
+    over_limit = [row for row in ranked if row[3] >= open_at]
+
+    if over_limit:
         status = STATUS_OPEN
-        verdict = (f"at or above {open_at * 100:.0f}% of limit on average - capacity "
-                   "action needed")
+        verdict = (
+            f"{len(over_limit)} asset(s) at or above {open_at * 100:.0f}% of their "
+            "limit - capacity action needed"
+        )
     elif avg >= complete_below:
         status = STATUS_IN_PROGRESS
-        verdict = (f"between {complete_below * 100:.0f}% and {open_at * 100:.0f}% of "
-                   "limit on average - monitor usage and plan limit increases")
+        verdict = (
+            f"average utilization {avg * 100:.1f}% is in the {complete_below * 100:.0f}-"
+            f"{open_at * 100:.0f}% monitor band - plan limit increases"
+        )
     else:
         status = STATUS_COMPLETED
-        verdict = f"below {complete_below * 100:.0f}% of limit on average - ample headroom"
+        verdict = (
+            f"average utilization {avg * 100:.1f}% is below {complete_below * 100:.0f}% "
+            f"and no asset is at/above the {open_at * 100:.0f}% action threshold - "
+            "ample headroom"
+        )
 
-    ranked = sorted(assessed, key=lambda t: t[3], reverse=True)
-    top_label, top_n, top_lim, top_f = ranked[0]
     per_asset = "; ".join(
         f"{label} {count:,}/{limit:,} ({frac * 100:.1f}%)"
         for label, count, limit, frac in ranked
     )
     reason = (
-        f"Average quota utilization is {avg * 100:.1f}% across {len(assessed)} documented "
-        f"limit(s) - {verdict}. Highest: {top_label} at {top_f * 100:.1f}% "
-        f"({top_n:,}/{top_lim:,}). Per-asset: {per_asset}."
+        f"Service-limit utilization across {len(assessed)} documented limit(s) "
+        f"(average {avg * 100:.1f}%) - {verdict}. "
     )
-    if unavailable:
-        reason += (
-            " Not auto-counted (confirm manually): " + ", ".join(unavailable) + "."
+    if over_limit:
+        drivers = "; ".join(
+            f"{label} {frac * 100:.1f}% ({count:,}/{limit:,})"
+            for label, count, limit, frac in over_limit
         )
+        reason += f"Driving the status (>= {open_at * 100:.0f}% of limit): {drivers}. "
+    reason += f"All assessed assets, highest first: {per_asset}."
+    if unavailable:
+        reason += " Not auto-counted (confirm manually): " + ", ".join(unavailable) + "."
     reason += " Also " + _QUOTA_MANUAL_NOTES
 
     return Result(
         "OE-04-01", "", "", "", status, reason,
         {
             "avg_utilization_pct": round(avg * 100, 2),
+            "max_utilization_pct": round(ranked[0][3] * 100, 2),
+            "over_limit_assets": [label for label, *_ in over_limit],
             "assessed_count": len(assessed),
             "assets": {label: {"count": count, "limit": limit,
                                "utilization_pct": round(frac * 100, 2)}
