@@ -1209,72 +1209,174 @@ def oe_03_04(ctx: Ctx) -> Result:
 # ----------------------------------------------------------------------------------
 
 
+#: Documented Databricks resource limits used as the denominator for quota-utilization
+#: scoring, from the published limits docs (docs.databricks.com/.../resources/limits).
+#: Many are per-account defaults that can be raised, so they are config-overridable via
+#: ``cfg["quota_limits"]`` (``00_config``). ``kind`` tells the check how to count usage:
+#:   sql_count   - a scalar COUNT query (``query``)
+#:   sql_max     - the fullest group (``query`` returns the max per catalog/schema)
+#:   sdk_count   - length of an SDK list (``sdk`` = WorkspaceClient attribute)
+DEFAULT_QUOTA_LIMITS: dict[str, dict] = {
+    "saved_jobs": {
+        "label": "Saved jobs (per workspace)", "limit": 12_000, "kind": "sql_count",
+        "requires": "system.lakeflow.jobs",
+        "query": "SELECT count(DISTINCT job_id) AS n FROM system.lakeflow.jobs "
+                 "WHERE delete_time IS NULL"},
+    "saved_pipelines": {
+        "label": "Saved Lakeflow pipelines (per workspace)", "limit": 12_000,
+        "kind": "sql_count", "requires": "system.lakeflow.pipelines",
+        "query": "SELECT count(*) AS n FROM system.lakeflow.pipelines "
+                 "WHERE delete_time IS NULL"},
+    "catalogs": {
+        "label": "Catalogs (per metastore)", "limit": 1_000, "kind": "sql_count",
+        "requires": "system.information_schema.catalogs",
+        "query": "SELECT count(*) AS n FROM system.information_schema.catalogs "
+                 "WHERE catalog_name NOT IN ('system','__databricks_internal','samples')"},
+    "schemas_per_catalog": {
+        "label": "Schemas in the fullest catalog (per catalog)", "limit": 10_000,
+        "kind": "sql_max", "requires": "system.information_schema.schemata",
+        "query": "SELECT max(c) AS n FROM (SELECT catalog_name, count(*) c "
+                 "FROM system.information_schema.schemata GROUP BY catalog_name)"},
+    "tables_per_schema": {
+        "label": "Tables in the fullest schema (per schema)", "limit": 10_000,
+        "kind": "sql_max", "requires": "system.information_schema.tables",
+        "query": "SELECT max(c) AS n FROM (SELECT table_catalog, table_schema, count(*) c "
+                 "FROM system.information_schema.tables GROUP BY table_catalog, table_schema)"},
+    "tables_metastore": {
+        "label": "Tables (per metastore)", "limit": 1_000_000, "kind": "sql_count",
+        "requires": "system.information_schema.tables",
+        "query": "SELECT count(*) AS n FROM system.information_schema.tables"},
+    "functions_per_schema": {
+        "label": "Functions in the fullest schema (per schema)", "limit": 10_000,
+        "kind": "sql_max", "requires": "system.information_schema.routines",
+        "query": "SELECT max(c) AS n FROM (SELECT routine_catalog, routine_schema, "
+                 "count(*) c FROM system.information_schema.routines "
+                 "GROUP BY routine_catalog, routine_schema)"},
+    "volumes_per_schema": {
+        "label": "Volumes in the fullest schema (per schema)", "limit": 10_000,
+        "kind": "sql_max", "requires": "system.information_schema.volumes",
+        "query": "SELECT max(c) AS n FROM (SELECT volume_catalog, volume_schema, count(*) c "
+                 "FROM system.information_schema.volumes GROUP BY volume_catalog, volume_schema)"},
+    "sql_warehouses": {
+        "label": "SQL warehouses (per workspace)", "limit": 1_000,
+        "kind": "sdk_count", "sdk": "warehouses"},
+    "apps": {
+        "label": "Databricks Apps (per workspace)", "limit": 100,
+        "kind": "sdk_count", "sdk": "apps"},
+    "secret_scopes": {
+        "label": "Secret scopes (per workspace)", "limit": 1_000,
+        "kind": "sdk_count", "sdk": "secrets", "sdk_sub": "list_scopes"},
+    "uc_registered_models": {
+        "label": "UC registered models (per metastore)", "limit": 5_000,
+        "kind": "sdk_count", "sdk": "registered_models"},
+}
+
+#: Documented limits we cannot (reliably) count from workspace telemetry - surfaced in
+#: the rationale as items to confirm manually rather than silently dropped.
+_QUOTA_MANUAL_NOTES = (
+    "concurrent task runs (2,000/workspace) and parent task runs (750/workspace) are "
+    "runtime-concurrency limits - inspect peak concurrency in run history; and "
+    "account-level quotas (users/SPs 10,000, groups 5,000, workspaces per tier) are not "
+    "workspace-scoped. Confirm any account-level limit increases in the account console."
+)
+
+
 def oe_04_01(ctx: Ctx) -> Result:
-    """Manage service limits and quotas."""
-    # "No pressure observed" only means something if the sources were readable.
-    # Otherwise absence of evidence would masquerade as evidence of absence.
-    sources = {
-        "system.access.audit": ctx.has_table("system.access.audit"),
-        "system.query.history": ctx.has_table("system.query.history"),
-        "system.compute.warehouse_events": ctx.has_table("system.compute.warehouse_events"),
-    }
-    if not any(sources.values()):
+    """Manage service limits and quotas.
+
+    Scored as resource-quota utilization: for each documented limit we can count, the
+    denominator is the published limit and the numerator is current usage, giving a
+    utilization %. The status is the average utilization across all counted assets, and
+    is *inverse* - more consumed capacity is worse, because approaching a limit is what
+    needs action:
+
+        avg < 60%      -> completed    (ample headroom)
+        60% <= avg <80% -> in-progress  (monitor, plan increases)
+        avg >= 80%     -> open         (capacity action needed)
+
+    Per-asset utilization is listed in the rationale; limits that cannot be counted from
+    telemetry are called out for manual confirmation. Limits are config-overridable
+    (``cfg["quota_limits"]``) because many are per-account defaults that can be raised.
+    """
+    limits = dict(ctx.cfg.get("quota_limits") or DEFAULT_QUOTA_LIMITS)
+    # Light-touch override: {asset_key: effective_limit} for limits you've had raised,
+    # without having to redeclare the whole table.
+    for key, new_limit in (ctx.cfg.get("quota_limit_overrides") or {}).items():
+        if key in limits and new_limit:
+            limits[key] = {**limits[key], "limit": int(new_limit)}
+    complete_below = float(ctx.cfg.get("quota_complete_below", 0.60))
+    open_at = float(ctx.cfg.get("quota_open_at", 0.80))
+
+    assessed: list[tuple[str, int, int, float]] = []  # (label, count, limit, frac)
+    unavailable: list[str] = []
+    for spec in limits.values():
+        label = spec["label"]
+        limit = spec.get("limit") or 0
+        count: int | None = None
+        kind = spec.get("kind")
+        if kind in ("sql_count", "sql_max"):
+            if ctx.has_table(spec["requires"]):
+                count = ctx.count_safe(spec["query"])
+            else:
+                count = None
+        elif kind == "sdk_count":
+            count = _sdk_count(ctx, spec["sdk"], spec.get("sdk_sub", "list"))
+        if count is None or limit <= 0:
+            unavailable.append(label)
+            continue
+        assessed.append((label, int(count), int(limit), count / limit))
+
+    if not assessed:
         return Result(
             "OE-04-01", "", "", "", STATUS_OPEN,
-            "None of the sources needed to detect quota pressure are readable "
-            "(system.access.audit, system.query.history, system.compute.warehouse_events), "
-            "so limits and quotas cannot be assessed.",
-            {"readable_sources": 0},
+            "No countable resources were readable (Unity Catalog information_schema, "
+            "system.lakeflow.*, or the Workspace SDK), so quota utilization cannot be "
+            "assessed.",
+            {"assessed_count": 0},
         )
-    throttles = 0
-    if ctx.has_table("system.access.audit"):
-        throttles = ctx.count_safe(
-            f"""
-            SELECT count(*) AS n FROM system.access.audit
-            WHERE event_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
-              AND (lower(coalesce(response.error_message, '')) RLIKE
-                     '(quota|limit exceeded|too many requests|throttl|resource_exhausted)'
-                   OR try_cast(response.status_code AS INT) = 429)
-            """
+
+    avg = sum(f for *_, f in assessed) / len(assessed)
+    if avg >= open_at:
+        status = STATUS_OPEN
+        verdict = (f"at or above {open_at * 100:.0f}% of limit on average - capacity "
+                   "action needed")
+    elif avg >= complete_below:
+        status = STATUS_IN_PROGRESS
+        verdict = (f"between {complete_below * 100:.0f}% and {open_at * 100:.0f}% of "
+                   "limit on average - monitor usage and plan limit increases")
+    else:
+        status = STATUS_COMPLETED
+        verdict = f"below {complete_below * 100:.0f}% of limit on average - ample headroom"
+
+    ranked = sorted(assessed, key=lambda t: t[3], reverse=True)
+    top_label, top_n, top_lim, top_f = ranked[0]
+    per_asset = "; ".join(
+        f"{label} {count:,}/{limit:,} ({frac * 100:.1f}%)"
+        for label, count, limit, frac in ranked
+    )
+    reason = (
+        f"Average quota utilization is {avg * 100:.1f}% across {len(assessed)} documented "
+        f"limit(s) - {verdict}. Highest: {top_label} at {top_f * 100:.1f}% "
+        f"({top_n:,}/{top_lim:,}). Per-asset: {per_asset}."
+    )
+    if unavailable:
+        reason += (
+            " Not auto-counted (confirm manually): " + ", ".join(unavailable) + "."
         )
-    queued = 0
-    if ctx.has_table("system.query.history"):
-        queued = ctx.count_safe(
-            f"""
-            SELECT count(*) AS n FROM system.query.history
-            WHERE start_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-              AND coalesce(waiting_at_capacity_duration_ms, 0) > 0
-            """
-        )
-    upsize_failures = 0
-    if ctx.has_table("system.compute.warehouse_events"):
-        upsize_failures = ctx.count_safe(
-            f"""
-            SELECT count(*) AS n FROM system.compute.warehouse_events
-            WHERE event_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-              AND lower(coalesce(event_type, '')) RLIKE '(scaled_up_failed|failed)'
-            """
-        )
-    total_signals = throttles + queued + upsize_failures
-    readable = sum(1 for v in sources.values() if v)
-    if total_signals == 0:
-        return Result(
-            "OE-04-01", "", "", "", STATUS_COMPLETED,
-            f"No quota errors, capacity queuing, or scale-up failures observed in the "
-            f"last {ctx.lookback_days} days across {readable} of {len(sources)} readable "
-            "source(s), so current limits are not constraining workloads. Note this shows "
-            "headroom today, not that limits are documented and tracked.",
-            {"throttle_events": 0, "queued_queries": 0, "warehouse_failures": 0,
-             "readable_sources": readable},
-        )
+    reason += " Also " + _QUOTA_MANUAL_NOTES
+
     return Result(
-        "OE-04-01", "", "", "", STATUS_IN_PROGRESS,
-        f"Capacity pressure detected in the last {ctx.lookback_days} days: "
-        f"{throttles:,} quota/throttling error(s), {queued:,} query/queries queued at "
-        f"capacity, and {upsize_failures:,} warehouse scale-up failure(s). Review "
-        "service limits and request increases where needed.",
-        {"throttle_events": throttles, "queued_queries": queued,
-         "warehouse_failures": upsize_failures},
+        "OE-04-01", "", "", "", status, reason,
+        {
+            "avg_utilization_pct": round(avg * 100, 2),
+            "assessed_count": len(assessed),
+            "assets": {label: {"count": count, "limit": limit,
+                               "utilization_pct": round(frac * 100, 2)}
+                       for label, count, limit, frac in assessed},
+            "uncounted": unavailable,
+            "complete_below_pct": round(complete_below * 100, 2),
+            "open_at_pct": round(open_at * 100, 2),
+        },
     )
 
 
