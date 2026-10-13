@@ -856,9 +856,11 @@ def r_04_02(ctx: Ctx) -> Result:
         metrics={"time_travel_statements": tt_usage, "catalogs_with_retention": retention,
                  "scoped": True},
     )
-    if res.status == STATUS_COMPLETED and tt_usage == 0:
-        res.status = STATUS_OPEN
-        res.reason += " Downgraded to open: capability is available but untested."
+    # Scored on capability (Delta coverage) alone: Delta tables inherently support
+    # time travel / RESTORE, so broad Delta adoption means the control is in place.
+    # Observed time-travel usage and custom retention are reported as context in the
+    # rationale above but do not change the status (restores are episodic, and
+    # programmatic time travel is not visible in query history anyway).
     return res
 
 
