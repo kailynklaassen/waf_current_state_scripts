@@ -16,12 +16,23 @@ from waf_core import (
     fmt_pct,
     manual_result,
     ratio_result,
+    ratio_status,
 )
 
 PILLAR_ID = "cost-optimization"
 
-#: Runtimes at or above this major version count as "up to date" for CO-01-04.
-CURRENT_DBR_MAJOR = 14
+#: CO-01-04 reference: a cluster is "up to date" if its DBR major is within this many
+#: versions of the newest major actually seen in the workspace fleet. Self-calibrating
+#: so it never goes stale; override with an absolute bar via cfg["current_dbr_major"].
+DEFAULT_DBR_MAJOR_TOLERANCE = 2
+
+#: CO-03-03 chargeback tag-key tokens (RLIKE, case-insensitive). A billing record is
+#: "attributable" if any custom tag key matches one of these. Override in 00_config
+#: (cfg["chargeback_tag_patterns"]) to match the tag taxonomy an environment uses.
+DEFAULT_CHARGEBACK_TAG_PATTERNS = [
+    "cost", "team", "project", "owner", "business", "dept", "department", "bu",
+    "chargeback", "env",
+]
 
 
 # ----------------------------------------------------------------------------------
@@ -55,47 +66,43 @@ def co_01_01(ctx: Ctx) -> Result:
 
 
 def co_01_02(ctx: Ctx) -> Result:
-    """Use job clusters (not all-purpose) for automated workloads."""
+    """Use job clusters (not all-purpose) for automated workloads.
+
+    Binary by design: any job running on all-purpose compute is a cost anti-pattern
+    (all-purpose lists at ~2-4x the job-compute rate), so there is no partial credit -
+    any such job -> open with the count; none -> completed.
+    """
     if not ctx.has_table("system.billing.usage"):
         return Result(
             "CO-01-02", "", "", "", STATUS_OPEN,
-            "system.billing.usage is not readable, so compute-type spend cannot be split.",
+            "system.billing.usage is not readable, so job compute type cannot be assessed.",
         )
     row = ctx.one(
         f"""
-        SELECT
-          sum(usage_quantity) AS total,
-          sum(CASE WHEN lower(coalesce(sku_name, '')) LIKE '%all_purpose%'
-                   THEN usage_quantity ELSE 0 END) AS all_purpose,
-          sum(CASE WHEN lower(coalesce(sku_name, '')) LIKE '%jobs%'
-                   THEN usage_quantity ELSE 0 END) AS jobs
+        SELECT count(DISTINCT usage_metadata.job_id) AS jobs_on_ap,
+               round(sum(usage_quantity), 2) AS ap_dbus
         FROM system.billing.usage
         WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
-          AND lower(coalesce(billing_origin_product, '')) NOT IN ('sql', 'databricks_sql')
+          AND lower(coalesce(sku_name, '')) LIKE '%all_purpose%'
+          AND usage_metadata.job_id IS NOT NULL
         """
     )
-    total = float(row.get("total") or 0)
-    all_purpose = float(row.get("all_purpose") or 0)
-    if total <= 0:
+    jobs_on_ap = int(row.get("jobs_on_ap") or 0)
+    ap_dbus = float(row.get("ap_dbus") or 0)
+    if jobs_on_ap == 0:
         return Result(
-            "CO-01-02", "", "", "", STATUS_OPEN,
-            f"No non-SQL compute usage recorded in the last {ctx.lookback_days} days.",
+            "CO-01-02", "", "", "", STATUS_COMPLETED,
+            f"No jobs ran on all-purpose compute in the last {ctx.lookback_days} days; "
+            "automated workloads use job or serverless compute.",
+            {"jobs_on_all_purpose": 0},
         )
-    non_ap = total - all_purpose
-    return ratio_result(
-        "CO-01-02",
-        int(round(non_ap)),
-        int(round(total)),
-        f"non-SQL DBUs in the last {ctx.lookback_days} days run on job or serverless "
-        "compute rather than the more expensive all-purpose SKU",
-        complete_at=ctx.complete_at,
-        extra=(
-            f"All-purpose consumption: {all_purpose:,.0f} DBU "
-            f"({all_purpose / total * 100:.1f}%). All-purpose lists at roughly 2-4x the "
-            "job-compute rate, so scheduled work belongs on job clusters."
-        ),
-        metrics={"all_purpose_dbus": round(all_purpose, 2),
-                 "total_dbus": round(total, 2)},
+    return Result(
+        "CO-01-02", "", "", "", STATUS_OPEN,
+        f"{jobs_on_ap:,} job(s) ran on all-purpose compute in the last "
+        f"{ctx.lookback_days} days ({ap_dbus:,.0f} all-purpose DBU attributed to jobs). "
+        "All-purpose lists at roughly 2-4x the job-compute rate - move these scheduled "
+        "workloads onto job clusters.",
+        {"jobs_on_all_purpose": jobs_on_ap, "all_purpose_job_dbus": round(ap_dbus, 2)},
     )
 
 
@@ -140,7 +147,7 @@ def co_01_04(ctx: Ctx) -> Result:
             "system.compute.clusters is not readable, so runtime versions cannot be "
             "assessed.",
         )
-    row = ctx.one(
+    rows = ctx.sql(
         f"""
         WITH latest AS (
           SELECT cluster_id, dbr_version,
@@ -148,41 +155,48 @@ def co_01_04(ctx: Ctx) -> Result:
           FROM system.compute.clusters
           WHERE delete_time IS NULL
             AND change_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-        ),
-        parsed AS (
-          SELECT cluster_id, dbr_version,
-                 try_cast(regexp_extract(coalesce(dbr_version, ''), '^([0-9]+)', 1) AS INT) AS major
-          FROM latest WHERE rn = 1
         )
-        SELECT count(*) AS total,
-               count_if(major >= {CURRENT_DBR_MAJOR}) AS current_dbr,
-               min(major) AS oldest
-        FROM parsed
+        SELECT try_cast(regexp_extract(coalesce(dbr_version, ''), '^([0-9]+)', 1) AS INT) AS major,
+               count(*) AS n
+        FROM latest WHERE rn = 1
+        GROUP BY 1
         """
     )
-    total = int(row.get("total") or 0)
-    current = int(row.get("current_dbr") or 0)
-    oldest = row.get("oldest")
+    by_major = {int(r["major"]): int(r["n"]) for r in rows if r["major"] is not None}
+    total = sum(by_major.values())
     if total == 0:
         return Result(
             "CO-01-04", "", "", "", STATUS_COMPLETED,
-            f"No classic clusters active in the last {ctx.lookback_days} days; serverless "
-            "compute is always on a current, Databricks-managed runtime.",
+            f"No classic clusters with a parseable runtime active in the last "
+            f"{ctx.lookback_days} days; serverless compute is always on a current, "
+            "Databricks-managed runtime.",
             {"clusters": 0},
         )
+    newest = max(by_major)
+    oldest = min(by_major)
+    # Reference "current" major: an explicit config bar, else self-calibrated to the
+    # newest major in the fleet minus a tolerance (so it never goes stale).
+    configured = ctx.cfg.get("current_dbr_major")
+    threshold = int(configured) if configured else max(newest - DEFAULT_DBR_MAJOR_TOLERANCE, 1)
+    current = sum(n for major, n in by_major.items() if major >= threshold)
+    ref = (
+        f"configured bar DBR {threshold}.x"
+        if configured
+        else f"DBR {threshold}.x or newer (within {DEFAULT_DBR_MAJOR_TOLERANCE} major "
+             f"version(s) of the fleet's newest, DBR {newest}.x)"
+    )
     return ratio_result(
         "CO-01-04",
         current,
         total,
-        f"active clusters run Databricks Runtime {CURRENT_DBR_MAJOR}.x or newer",
+        f"active clusters run {ref}",
         complete_at=ctx.complete_at,
         extra=(
-            f"Oldest major version in use: DBR {oldest}.x. Newer runtimes deliver "
-            "free performance (and therefore cost) improvements."
-            if oldest is not None
-            else ""
+            f"Runtime spread: newest DBR {newest}.x, oldest DBR {oldest}.x. Newer "
+            "runtimes deliver free performance (and therefore cost) improvements."
         ),
-        metrics={"oldest_dbr_major": oldest, "threshold_major": CURRENT_DBR_MAJOR},
+        metrics={"oldest_dbr_major": oldest, "newest_dbr_major": newest,
+                 "threshold_major": threshold, "threshold_configured": bool(configured)},
     )
 
 
@@ -575,7 +589,17 @@ def co_02_02(ctx: Ctx) -> Result:
 
 
 def co_02_03(ctx: Ctx) -> Result:
-    """Use compute policies to control costs."""
+    """Use compute policies to control costs.
+
+    Scored as two equal halves, so defining policies and actually enforcing them each
+    count for 50%:
+
+    * **Policies exist (50%)** - at least one cluster policy is defined.
+    * **Enforcement (50%)** - the share of active clusters created under a policy.
+
+    Blended score = 0.5 * (policies exist) + 0.5 * (governed / total clusters), then the
+    standard thresholds. Policies that exist but govern nothing cap at ~50%.
+    """
     policies = None
     w = ctx.w
     if w is not None:
@@ -583,62 +607,56 @@ def co_02_03(ctx: Ctx) -> Result:
             policies = sum(1 for _ in w.cluster_policies.list())
         except Exception:
             policies = None
-    if not ctx.has_table("system.compute.clusters"):
-        if policies:
-            return Result(
-                "CO-02-03", "", "", "", STATUS_IN_PROGRESS,
-                f"{policies} cluster policy/policies exist, but cluster records are not "
-                "readable so policy enforcement coverage cannot be measured.",
-                {"policies": policies},
+
+    total = governed = 0
+    if ctx.has_table("system.compute.clusters"):
+        row = ctx.one(
+            f"""
+            WITH latest AS (
+              SELECT cluster_id, policy_id,
+                     row_number() OVER (PARTITION BY cluster_id ORDER BY change_time DESC) AS rn
+              FROM system.compute.clusters
+              WHERE delete_time IS NULL
+                AND change_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
             )
+            SELECT count(*) AS total,
+                   count_if(policy_id IS NOT NULL AND policy_id <> '') AS governed
+            FROM latest WHERE rn = 1
+            """
+        )
+        total = int(row.get("total") or 0)
+        governed = int(row.get("governed") or 0)
+
+    # Policies exist if the SDK saw any, or (SDK unavailable) if any cluster cites one.
+    if policies is None and not ctx.has_table("system.compute.clusters"):
         return Result(
             "CO-02-03", "", "", "", STATUS_OPEN,
-            "Neither cluster policies nor cluster records are readable, so cost "
+            "Neither cluster policies (SDK) nor cluster records are readable, so cost "
             "guardrails cannot be assessed.",
+            {"policies": None},
         )
-    row = ctx.one(
-        f"""
-        WITH latest AS (
-          SELECT cluster_id, policy_id, cluster_source,
-                 row_number() OVER (PARTITION BY cluster_id ORDER BY change_time DESC) AS rn
-          FROM system.compute.clusters
-          WHERE delete_time IS NULL
-            AND change_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-        )
-        SELECT count(*) AS total,
-               count_if(policy_id IS NOT NULL AND policy_id <> '') AS governed
-        FROM latest WHERE rn = 1
-        """
+    have_policies = bool(policies) or governed > 0
+    policies_half = 1.0 if have_policies else 0.0
+    enforce_half = (governed / total) if total > 0 else 0.0
+    score = 0.5 * policies_half + 0.5 * enforce_half
+    status, _ = ratio_status(round(score * 10_000), 10_000, ctx.complete_at)
+
+    pol_txt = (f"{policies} policy/policies defined" if policies is not None
+               else ("policies in use (SDK inventory unavailable)" if governed > 0
+                     else "no policies detected (SDK inventory unavailable)"))
+    enforce_txt = (f"{governed:,} of {total:,} active clusters created under a policy "
+                   f"({enforce_half * 100:.1f}%)" if total > 0
+                   else f"no clusters active in the last {ctx.lookback_days} days to "
+                        "measure enforcement")
+    reason = (
+        f"Cost-guardrail score {score * 100:.1f}% - 50% policies exist "
+        f"({pol_txt}) + 50% enforcement ({enforce_txt})."
     )
-    total = int(row.get("total") or 0)
-    governed = int(row.get("governed") or 0)
-    if total == 0:
-        if policies:
-            return Result(
-                "CO-02-03", "", "", "", STATUS_COMPLETED,
-                f"{policies} cluster policy/policies are defined and no ungoverned "
-                f"clusters were created in the last {ctx.lookback_days} days.",
-                {"policies": policies, "clusters": 0},
-            )
-        return Result(
-            "CO-02-03", "", "", "", STATUS_OPEN,
-            f"No cluster policies found and no clusters active in the last "
-            f"{ctx.lookback_days} days.",
-            {"policies": 0},
-        )
-    return ratio_result(
-        "CO-02-03",
-        governed,
-        total,
-        "active clusters were created under a cluster policy that constrains size, "
-        "runtime and auto-termination",
-        complete_at=ctx.complete_at,
-        extra=(
-            f"{policies} policy/policies defined in the workspace."
-            if policies is not None
-            else "Policy inventory unavailable via the SDK."
-        ),
-        metrics={"policies": policies, "governed_clusters": governed},
+    return Result(
+        "CO-02-03", "", "", "", status, reason,
+        {"policies": policies, "governed_clusters": governed, "total_clusters": total,
+         "policies_exist": have_policies, "enforcement_pct": round(enforce_half * 100, 2),
+         "blended_pct": round(score * 100, 2)},
     )
 
 
@@ -745,6 +763,16 @@ def co_03_02(ctx: Ctx) -> Result:
 
 def co_03_03(ctx: Ctx) -> Result:
     """Implement observability to track and chargeback cost."""
+    # If the environment doesn't practice chargeback (confirmed with the owners and set
+    # in config), don't assess tagging for a process that doesn't exist - record it open.
+    if ctx.cfg.get("chargeback_enabled", True) is False:
+        return Result(
+            "CO-03-03", "", "", "", STATUS_OPEN,
+            "Chargeback is not practiced in this environment (CHARGEBACK_ENABLED = False "
+            "in config), so cost-attribution tagging is not assessed. Introducing a "
+            "cost-centre/team tagging standard would enable chargeback.",
+            {"chargeback_enabled": False},
+        )
     if not ctx.has_table("system.billing.usage"):
         return Result(
             "CO-03-03", "", "", "", STATUS_OPEN,
@@ -752,12 +780,15 @@ def co_03_03(ctx: Ctx) -> Result:
             "assessed.",
         )
     # Chargeback needs a stable dimension: a cost-center-like tag, not just any tag.
+    # The tag-key tokens are config-driven so they match the environment's taxonomy.
+    patterns = ctx.cfg.get("chargeback_tag_patterns") or DEFAULT_CHARGEBACK_TAG_PATTERNS
+    tag_regex = "(" + "|".join(p.replace("'", "''") for p in patterns) + ")"
     row = ctx.one(
         f"""
         SELECT count(*) AS total,
                count_if(
                  exists(map_keys(coalesce(custom_tags, map())),
-                        k -> lower(k) RLIKE '(cost|team|project|owner|business|dept|department|bu|chargeback|env)')
+                        k -> lower(k) RLIKE '{tag_regex}')
                ) AS attributable
         FROM system.billing.usage
         WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS

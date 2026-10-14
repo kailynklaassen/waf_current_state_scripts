@@ -271,55 +271,17 @@ def oe_01_04(ctx: Ctx) -> Result:
 
 def oe_01_05(ctx: Ctx) -> Result:
     """Define environment isolation strategy."""
-    sys_cats = ctx.cfg.get("system_catalogs", [])
-    from waf_core import _like_clause  # noqa: PLC0415
-
-    not_system = _like_clause("catalog_name", sys_cats, negate=True)
-    rows = ctx.sql(
-        f"""
-        SELECT catalog_name FROM system.information_schema.catalogs
-        WHERE {not_system} ORDER BY 1
-        """
-    )
-    names = [r["catalog_name"].lower() for r in rows]
-    envs = {
-        "prod": [n for n in names if any(t in n for t in ("prod", "prd"))],
-        "dev": [n for n in names if any(t in n for t in ("dev", "sandbox"))],
-        "test": [n for n in names if any(t in n for t in ("test", "qa", "stag", "uat"))],
-    }
-    found = {k: v for k, v in envs.items() if v}
-    workspaces = 0
-    if ctx.has_table("system.access.workspaces_latest"):
-        workspaces = ctx.count_safe(
-            "SELECT count(DISTINCT workspace_id) AS n FROM system.access.workspaces_latest"
-        )
-    if not found:
-        return Result(
-            "OE-01-05", "", "", "", STATUS_OPEN,
-            f"No environment separation detectable by naming convention across "
-            f"{len(names)} catalog(s) and {workspaces} workspace(s). Isolation may be "
-            "implemented per-workspace or under a different naming standard - confirm "
-            "with your team.",
-            {"catalogs": len(names), "workspaces": workspaces},
-        )
-    detail = "; ".join(f"{k}: {len(v)} catalog(s)" for k, v in found.items())
-    # Separating prod from at least one lower environment is the bar.
-    status = (
-        STATUS_COMPLETED
-        if "prod" in found and len(found) >= 2
-        else STATUS_IN_PROGRESS
-    )
-    return Result(
-        "OE-01-05", "", "", "", status,
-        f"{len(found)} of 3 environment tiers are distinguishable by catalog naming "
-        f"({detail}) across {len(names)} catalog(s) and {workspaces} workspace(s). "
-        + (
-            "Production is separated from lower environments."
-            if status == STATUS_COMPLETED
-            else "Production is not clearly separated from lower environments."
-        ),
-        {"environments": {k: len(v) for k, v in found.items()},
-         "catalogs": len(names), "workspaces": workspaces},
+    # Isolation is an architectural decision (separate workspaces / catalogs / metastores
+    # per environment, with a controlled promotion path). Catalog naming can only hint at
+    # it and misreads both well-isolated multi-workspace setups and non-standard naming,
+    # so this is answered by a human rather than scored off a naming heuristic.
+    return manual_result(
+        "OE-01-05",
+        "environment isolation is an architectural decision (separate workspaces, "
+        "catalogs or metastores per environment with a controlled promotion path) that "
+        "catalog naming can only hint at, not confirm.",
+        "the environment isolation model (per-workspace vs per-catalog), how production "
+        "is separated from dev/test, and the promotion process between them.",
     )
 
 
