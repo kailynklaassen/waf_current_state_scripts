@@ -10,6 +10,7 @@ from __future__ import annotations
 from waf_core import (
     STATUS_COMPLETED,
     STATUS_IN_PROGRESS,
+    STATUS_MANUAL,
     STATUS_OPEN,
     Ctx,
     Result,
@@ -201,7 +202,16 @@ def co_01_04(ctx: Ctx) -> Result:
 
 
 def co_01_05(ctx: Ctx) -> Result:
-    """Only use GPUs for the right workloads."""
+    """Only use GPUs for the right workloads.
+
+    GPU usage is identified from the AWS GPU node families (g*/p*) in
+    system.billing.usage. If there is no GPU spend, there is nothing to misuse ->
+    completed. If GPUs ARE in use, whether each workload is the *right* use (deep
+    learning / LLM training or inference) cannot be confirmed from telemetry: MLflow
+    linkage covers <2% of GPU spend, and GPU-on-a-job is frequently legitimate ML
+    training - so this is surfaced as manual-review with the usage facts as evidence,
+    rather than scored off an unreliable proxy.
+    """
     if not ctx.has_table("system.billing.usage"):
         return Result(
             "CO-01-05", "", "", "", STATUS_OPEN,
@@ -209,56 +219,39 @@ def co_01_05(ctx: Ctx) -> Result:
         )
     row = ctx.one(
         f"""
-        SELECT
-          sum(usage_quantity) AS total,
-          sum(CASE WHEN lower(coalesce(sku_name, '')) RLIKE '(gpu|ml.*gpu)'
-                   THEN usage_quantity ELSE 0 END) AS gpu
+        SELECT round(sum(usage_quantity), 2) AS gpu_dbu,
+               round(sum(CASE WHEN usage_metadata.job_id IS NOT NULL
+                               OR usage_metadata.dlt_pipeline_id IS NOT NULL
+                              THEN usage_quantity ELSE 0 END), 2) AS gpu_automated,
+               count(DISTINCT usage_metadata.job_id) AS gpu_jobs
         FROM system.billing.usage
         WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+          AND lower(coalesce(usage_metadata.node_type, '')) RLIKE '^(g[0-9]|p[0-9])'
         """
     )
-    total = float(row.get("total") or 0)
-    gpu = float(row.get("gpu") or 0)
-    if total <= 0:
-        return Result(
-            "CO-01-05", "", "", "", STATUS_OPEN,
-            f"No billable usage recorded in the last {ctx.lookback_days} days.",
-        )
-    if gpu == 0:
+    gpu = float(row.get("gpu_dbu") or 0)
+    automated = float(row.get("gpu_automated") or 0)
+    gpu_jobs = int(row.get("gpu_jobs") or 0)
+    if gpu <= 0:
         return Result(
             "CO-01-05", "", "", "", STATUS_COMPLETED,
             f"No GPU DBUs consumed in the last {ctx.lookback_days} days, so there is no "
-            "GPU spend on non-GPU workloads.",
-            {"gpu_dbus": 0.0, "total_dbus": round(total, 2)},
+            "GPU spend to place on the wrong workload.",
+            {"gpu_dbus": 0.0},
         )
-    ml_runs = 0
-    if ctx.has_table("system.mlflow.runs_latest"):
-        ml_runs = ctx.count_safe(
-            f"""
-            SELECT count(*) AS n FROM system.mlflow.runs_latest
-            WHERE delete_time IS NULL
-              AND start_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-            """
-        )
-    share = gpu / total
-    # GPU spend is only justified when there is ML activity to justify it.
-    if ml_runs > 0:
-        status = STATUS_COMPLETED
-        verdict = (
-            f"{ml_runs:,} MLflow run(s) in the same window justify GPU use."
-        )
-    else:
-        status = STATUS_IN_PROGRESS
-        verdict = (
-            "No MLflow runs were recorded in the same window, so GPU spend may not be "
-            "tied to deep-learning workloads. Review whether these workloads need GPUs."
-        )
+    interactive = max(gpu - automated, 0)
     return Result(
-        "CO-01-05", "", "", "", status,
-        f"GPU consumption is {fmt_pct(share)} of DBUs in the last {ctx.lookback_days} "
-        f"days ({gpu:,.0f} of {total:,.0f}). {verdict}",
-        {"gpu_dbus": round(gpu, 2), "total_dbus": round(total, 2),
-         "gpu_share_pct": round(share * 100, 2), "mlflow_runs": ml_runs},
+        "CO-01-05", "", "", "", STATUS_MANUAL,
+        f"GPU compute is in use ({gpu:,.0f} DBU in the last {ctx.lookback_days} days: "
+        f"{automated:,.0f} on jobs/pipelines across {gpu_jobs} job(s), {interactive:,.0f} "
+        "interactive/other). Whether each GPU workload is the right use (deep learning / "
+        "LLM training or inference) cannot be confirmed from system tables - MLflow "
+        "linkage covers under 2% of GPU spend and GPU-on-a-job is often legitimate ML "
+        "training. Review the GPU workloads with their owners to confirm they are ML/DL, "
+        "not general compute that belongs on CPU.",
+        {"gpu_dbus": round(gpu, 2), "gpu_automated_dbus": round(automated, 2),
+         "gpu_interactive_dbus": round(interactive, 2), "gpu_jobs": gpu_jobs,
+         "automatable": False},
     )
 
 

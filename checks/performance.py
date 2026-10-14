@@ -73,45 +73,85 @@ def pe_01_01(ctx: Ctx) -> Result:
 
 
 def pe_01_02(ctx: Ctx) -> Result:
-    """Use an enterprise grade model serving service."""
+    """Use an enterprise grade model serving service.
+
+    Not just "do endpoints exist" but "does managed serving carry the ML/GenAI load":
+    scored as endpoint utilization - the share of active Model Serving endpoints that
+    actually served traffic in the window (idle endpoint sprawl is not enterprise-grade
+    use). If there are no endpoints at all yet ML/GenAI compute is being consumed,
+    inference is running off managed serving -> open.
+    """
     if not ctx.has_table("system.serving.served_entities"):
         return Result(
             "PE-01-02", "", "", "", STATUS_OPEN,
             "system.serving.served_entities is not readable, so model serving cannot be "
             "assessed.",
         )
-    row = ctx.one(
-        """
-        SELECT count(DISTINCT endpoint_id) AS endpoints,
-               count_if(foundation_model_config IS NOT NULL) AS foundation,
-               count_if(external_model_config IS NOT NULL) AS external,
-               count_if(custom_model_config IS NOT NULL) AS custom
-        FROM system.serving.served_entities
-        WHERE endpoint_delete_time IS NULL
-        """
+    active = ctx.count_safe(
+        "SELECT count(DISTINCT endpoint_id) AS n FROM system.serving.served_entities "
+        "WHERE endpoint_delete_time IS NULL"
     )
-    endpoints = int(row.get("endpoints") or 0)
-    if endpoints == 0:
+    # ML/GenAI consumption context (for the no-endpoints guard and the rationale).
+    genai_dbu = serving_dbu = 0.0
+    if ctx.has_table("system.billing.usage"):
+        brow = ctx.one(
+            f"""
+            SELECT sum(usage_quantity) AS genai,
+                   sum(CASE WHEN upper(coalesce(billing_origin_product, '')) = 'MODEL_SERVING'
+                            THEN usage_quantity ELSE 0 END) AS serving
+            FROM system.billing.usage
+            WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+              AND upper(coalesce(billing_origin_product, '')) IN
+                  ('MODEL_SERVING', 'VECTOR_SEARCH', 'AI_FUNCTIONS', 'AGENT_BRICKS',
+                   'AI_GATEWAY', 'SUPERVISOR_AGENT', 'AI_RUNTIME')
+            """
+        )
+        genai_dbu = float(brow.get("genai") or 0)
+        serving_dbu = float(brow.get("serving") or 0)
+
+    if active == 0:
+        if genai_dbu > 0:
+            return Result(
+                "PE-01-02", "", "", "", STATUS_OPEN,
+                f"No active Model Serving endpoints, yet {genai_dbu:,.0f} ML/GenAI DBU "
+                f"were consumed in the last {ctx.lookback_days} days - inference is "
+                "running off managed serving. Stand up enterprise-grade serving endpoints.",
+                {"endpoints": 0, "genai_dbu": round(genai_dbu, 2)},
+            )
         return Result(
             "PE-01-02", "", "", "", STATUS_OPEN,
-            "No active Model Serving endpoints found. Mark ignore in the WAF tool if "
-            "model serving is out of scope.",
+            "No active Model Serving endpoints and no ML/GenAI consumption found. Mark "
+            "ignore in the WAF tool if model serving is out of scope.",
             {"endpoints": 0},
         )
-    provisioned = ctx.count_safe(
-        """
-        SELECT count(*) AS n FROM system.serving.served_entities
-        WHERE endpoint_delete_time IS NULL
-          AND foundation_model_config.max_provisioned_throughput IS NOT NULL
-        """
-    )
-    return Result(
-        "PE-01-02", "", "", "", STATUS_COMPLETED,
-        f"{endpoints} managed Model Serving endpoint(s) in use "
-        f"({row.get('foundation')} foundation-model, {row.get('external')} external, "
-        f"{row.get('custom')} custom served entity/entities). {provisioned} use "
-        "provisioned throughput for predictable latency.",
-        {"endpoints": endpoints, "provisioned_throughput": provisioned},
+    with_traffic = requests = 0
+    if ctx.has_table("system.serving.endpoint_usage"):
+        trow = ctx.one(
+            f"""
+            SELECT count(DISTINCT se.endpoint_id) AS endpoints, count(*) AS requests
+            FROM system.serving.served_entities se
+            JOIN system.serving.endpoint_usage u ON u.served_entity_id = se.served_entity_id
+            WHERE se.endpoint_delete_time IS NULL
+              AND u.request_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
+            """
+        )
+        with_traffic = int(trow.get("endpoints") or 0)
+        requests = int(trow.get("requests") or 0)
+    share = f"{serving_dbu / genai_dbu * 100:.0f}%" if genai_dbu > 0 else "n/a"
+    return ratio_result(
+        "PE-01-02",
+        with_traffic,
+        active,
+        f"active Model Serving endpoints served traffic in the last {ctx.lookback_days} "
+        "days (managed serving is actually carrying inference, not idle endpoint sprawl)",
+        complete_at=ctx.complete_at,
+        extra=(
+            f"{requests:,} request(s) served; Model Serving is {share} of ML/GenAI DBU "
+            f"({serving_dbu:,.0f} of {genai_dbu:,.0f})."
+        ),
+        metrics={"active_endpoints": active, "endpoints_with_traffic": with_traffic,
+                 "requests": requests, "serving_dbu": round(serving_dbu, 2),
+                 "genai_dbu": round(genai_dbu, 2)},
     )
 
 

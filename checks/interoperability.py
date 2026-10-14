@@ -718,64 +718,76 @@ def iu_04_01(ctx: Ctx) -> Result:
 
 
 def iu_04_02(ctx: Ctx) -> Result:
-    """Publish data products semantically consistent across the enterprise."""
-    scope = ctx.scope
-    views = ctx.count_safe(
-        f"""
-        SELECT count(*) AS n FROM system.information_schema.tables
-        WHERE {scope.predicate()} AND table_type = 'VIEW'
-        """
-    )
-    tables = ctx.count_safe(
-        f"""
-        SELECT count(*) AS n FROM system.information_schema.tables
-        WHERE {scope.predicate()} AND table_type <> 'VIEW'
-        """
-    )
-    functions = ctx.count_safe(
-        f"""
-        SELECT count(*) AS n FROM system.information_schema.routines
-        WHERE {scope.predicate('routine_catalog', 'routine_schema')}
-        """
-    )
-    # Metric views are the semantic-consistency primitive; detect via table_type.
-    metric_views = ctx.count_safe(
-        f"""
-        SELECT count(*) AS n FROM system.information_schema.tables
-        WHERE {scope.predicate()}
-          AND lower(coalesce(table_type, '')) LIKE '%metric%'
-        """
-    )
-    total = views + tables
-    if total == 0:
+    """Publish data products semantically consistent across the enterprise.
+
+    Measures adoption of METRIC VIEWS - the semantic-layer primitive that keeps metric
+    definitions consistent across tools - by the consuming surfaces we can actually see:
+    the share of active Genie spaces and dashboards (from system.access.table_lineage)
+    that read a metric view rather than raw tables. Databricks Apps and table-level
+    consumption of metric views are NOT observable from system tables, so they are
+    flagged for manual confirmation rather than guessed at.
+    """
+    if not ctx.has_table("system.access.table_lineage"):
         return Result(
             "IU-04-02", "", "", "", STATUS_OPEN,
-            "No tables or views found in the assessed catalogs, so semantic consistency "
-            "cannot be assessed.",
-            {"scoped": True},
+            "system.access.table_lineage is not readable, so metric-view usage cannot be "
+            "assessed.",
         )
-    semantic_layer = views + metric_views + functions
+    row = ctx.one(
+        f"""
+        WITH mv AS (
+          SELECT lower(concat_ws('.', table_catalog, table_schema, table_name)) AS fqn
+          FROM system.information_schema.tables WHERE table_type = 'METRIC_VIEW'
+        ),
+        lin AS (
+          SELECT entity_metadata.genie_space_id AS gid,
+                 coalesce(entity_metadata.dashboard_id,
+                          entity_metadata.legacy_dashboard_id) AS did,
+                 lower(source_table_full_name) AS src
+          FROM system.access.table_lineage
+          WHERE event_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+        )
+        SELECT (SELECT count(*) FROM mv) AS metric_views,
+               count(DISTINCT gid) AS genie_total,
+               count(DISTINCT CASE WHEN src IN (SELECT fqn FROM mv) THEN gid END) AS genie_mv,
+               count(DISTINCT did) AS dash_total,
+               count(DISTINCT CASE WHEN src IN (SELECT fqn FROM mv) THEN did END) AS dash_mv
+        FROM lin
+        """
+    )
+    metric_views = int(row.get("metric_views") or 0)
+    gt = int(row.get("genie_total") or 0)
+    gm = int(row.get("genie_mv") or 0)
+    dt = int(row.get("dash_total") or 0)
+    dm = int(row.get("dash_mv") or 0)
+    surfaces = gt + dt
+    using = gm + dm
+    manual_note = (
+        "Databricks Apps and table-level metric-view consumption are not observable from "
+        "system tables - confirm those surfaces manually."
+    )
+    if surfaces == 0:
+        return Result(
+            "IU-04-02", "", "", "", STATUS_OPEN,
+            f"No Genie spaces or dashboards were observed reading any table in the last "
+            f"{ctx.lookback_days} days, so metric-view adoption cannot be measured. "
+            f"{metric_views:,} metric view(s) are defined. {manual_note}",
+            {"metric_views": metric_views},
+        )
     return ratio_result(
         "IU-04-02",
-        min(semantic_layer, total),
-        total,
-        f"data assets in {scope.label} are exposed through a semantic layer (views, "
-        "metric views or governed functions) that encodes shared business definitions "
-        "rather than raw tables",
-        complete_at=0.30,
+        using,
+        surfaces,
+        "active Genie spaces and dashboards read from a metric view (the semantic layer "
+        "that keeps metric definitions consistent) rather than only raw tables",
+        complete_at=ctx.complete_at,
         extra=(
-            f"{views} view(s), {metric_views} metric view(s) and {functions} governed "
-            "function(s) provide consistent definitions over "
-            f"{tables} base table(s)."
-            + (
-                ""
-                if metric_views
-                else " No metric views found; these are the strongest guarantee of "
-                "consistent metric definitions across tools."
-            )
+            f"{metric_views:,} metric view(s) defined. Genie spaces: {gm}/{gt}; "
+            f"dashboards: {dm}/{dt}. {manual_note}"
         ),
-        metrics={"views": views, "metric_views": metric_views, "functions": functions,
-                 "tables": tables, "scoped": True},
+        metrics={"metric_views": metric_views, "genie_spaces_total": gt,
+                 "genie_spaces_using_mv": gm, "dashboards_total": dt,
+                 "dashboards_using_mv": dm},
     )
 
 
