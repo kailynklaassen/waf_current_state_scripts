@@ -148,58 +148,106 @@ def iu_01_02(ctx: Ctx) -> Result:
     )
 
 
+#: client_application tokens for Databricks-certified partner BI/ETL tools (RLIKE,
+#: lowercased). Override in 00_config (cfg["partner_tools"]) to match the toolchain.
+DEFAULT_PARTNER_TOOLS = [
+    "tableau", "power bi", "powerbi", "looker", "qlik", "sigma", "thoughtspot",
+    "dbt", "fivetran", "informatica", "talend", "matillion", "alteryx", "sap",
+    "collibra", "alation", "atlan", "hightouch", "census", "airbyte", "excel",
+    "datadog", "hex", "streamlit", "mode", "preset", "superset",
+]
+
+
 def iu_01_03(ctx: Ctx) -> Result:
-    """Use certified partner tools."""
+    """Use certified partner tools.
+
+    Scored as the share of *interactive/BI* query volume that reaches the platform
+    through a governed tool rather than ad hoc. Automated job/pipeline queries use
+    native connectors by design and are excluded from the denominator.
+
+    - governed = a certified partner tool (``client_application``) OR a Databricks
+      dashboard OR Genie (curated self-service surfaces).
+    - ad hoc   = notebooks, the SQL editor, and raw drivers / CLI / unknown clients.
+
+    So one partner connection no longer passes the whole workspace - it is governed
+    coverage of real analytics traffic. The partner list is config-overridable.
+    """
     if not ctx.has_table("system.query.history"):
         return Result(
             "IU-01-03", "", "", "", STATUS_OPEN,
             "system.query.history is not readable, so client tooling cannot be "
             "identified.",
         )
-    rows = ctx.sql(
+    partners = ctx.cfg.get("partner_tools") or DEFAULT_PARTNER_TOOLS
+    partner_regex = "(" + "|".join(p.replace("'", "''") for p in partners) + ")"
+    is_partner = f"lower(coalesce(client_application, '')) RLIKE '{partner_regex}'"
+    is_dashboard = ("(query_source.dashboard_id IS NOT NULL "
+                    "OR query_source.legacy_dashboard_id IS NOT NULL)")
+    is_genie = "query_source.genie_space_id IS NOT NULL"
+    row = ctx.one(
         f"""
-        SELECT coalesce(client_application, 'unknown') AS app, count(*) AS n
+        SELECT count(*) AS denom,
+               count_if({is_partner} OR {is_dashboard} OR {is_genie}) AS governed,
+               count_if({is_partner}) AS partner,
+               count_if({is_dashboard}) AS dashboard,
+               count_if({is_genie}) AS genie,
+               count_if(query_source.notebook_id IS NOT NULL) AS notebook,
+               count_if(query_source.sql_query_id IS NOT NULL) AS sql_editor
         FROM system.query.history
         WHERE start_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-          AND client_application IS NOT NULL
-        GROUP BY 1 ORDER BY 2 DESC LIMIT 10
+          AND query_source.job_info.job_id IS NULL
+          AND query_source.pipeline_info.pipeline_id IS NULL
         """
     )
-    if not rows:
-        return Result(
-            "IU-01-03", "", "", "", STATUS_OPEN,
-            f"No client application information recorded in the last "
-            f"{ctx.lookback_days} days, so partner tool usage cannot be identified.",
+    denom = int(row.get("denom") or 0)
+    governed = int(row.get("governed") or 0)
+    partner = int(row.get("partner") or 0)
+    dashboard = int(row.get("dashboard") or 0)
+    genie = int(row.get("genie") or 0)
+    notebook = int(row.get("notebook") or 0)
+    sql_editor = int(row.get("sql_editor") or 0)
+    ad_hoc = max(denom - governed, 0)
+    other_adhoc = max(ad_hoc - notebook - sql_editor, 0)
+
+    # Which certified partner tools actually connected (names for the rationale).
+    partner_names: list[str] = []
+    if partner > 0:
+        prows = ctx.sql(
+            f"""
+            SELECT client_application AS app, count(*) AS n
+            FROM system.query.history
+            WHERE start_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
+              AND query_source.job_info.job_id IS NULL
+              AND query_source.pipeline_info.pipeline_id IS NULL
+              AND {is_partner}
+            GROUP BY 1 ORDER BY 2 DESC LIMIT 8
+            """
         )
-    known_partners = (
-        "tableau", "power bi", "powerbi", "looker", "qlik", "sigma", "thoughtspot",
-        "dbt", "fivetran", "informatica", "talend", "matillion", "alteryx", "sap",
-        "collibra", "alation", "atlan", "hightouch", "census", "airbyte", "excel",
-        "datadog", "hex", "streamlit", "mode", "preset", "superset",
-    )
-    partner_rows = [
-        r for r in rows if any(p in str(r["app"]).lower() for p in known_partners)
-    ]
-    total = sum(int(r["n"] or 0) for r in rows)
-    partner_queries = sum(int(r["n"] or 0) for r in partner_rows)
-    mix = ", ".join(f"{r['app']}={int(r['n'] or 0):,}" for r in rows[:6])
-    if not partner_rows:
-        return Result(
-            "IU-01-03", "", "", "", STATUS_OPEN,
-            f"No recognized certified partner tools appear in {total:,} attributed "
-            f"query/queries over the last {ctx.lookback_days} days. Top clients: {mix}. "
-            "Access may be via native drivers or an unrecognized client - confirm the "
-            "BI/ETL toolchain with your team.",
-            {"client_mix": {r["app"]: int(r["n"] or 0) for r in rows}},
-        )
-    return Result(
-        "IU-01-03", "", "", "", STATUS_COMPLETED,
-        f"{len(partner_rows)} certified partner tool(s) are connecting, accounting for "
-        f"{partner_queries:,} of {total:,} attributed query/queries "
-        f"({partner_queries / total * 100:.1f}%) in the last {ctx.lookback_days} days. "
-        f"Top clients: {mix}.",
-        {"partner_tools": [r["app"] for r in partner_rows],
-         "client_mix": {r["app"]: int(r["n"] or 0) for r in rows}},
+        partner_names = [r["app"] for r in prows if r.get("app")]
+
+    return ratio_result(
+        "IU-01-03",
+        governed,
+        denom,
+        f"interactive/BI queries in the last {ctx.lookback_days} days reached the "
+        "platform through a governed tool (a certified partner tool, a Databricks "
+        "dashboard, or Genie) rather than ad hoc (notebooks, SQL editor, raw drivers)",
+        complete_at=ctx.complete_at,
+        none_found=(
+            f"No interactive/BI queries (outside automated jobs/pipelines) were recorded "
+            f"in the last {ctx.lookback_days} days, so tooling cannot be assessed."
+        ),
+        extra=(
+            f"Governed: {partner:,} certified-partner"
+            + (f" ({', '.join(partner_names)})" if partner_names else "")
+            + f", {dashboard:,} dashboard, {genie:,} Genie. "
+            f"Ad hoc: {notebook:,} notebook, {sql_editor:,} SQL-editor, {other_adhoc:,} "
+            "raw driver/CLI/unknown. Automated job/pipeline queries are excluded."
+        ),
+        metrics={"governed_queries": governed, "partner_queries": partner,
+                 "dashboard_queries": dashboard, "genie_queries": genie,
+                 "notebook_queries": notebook, "sql_editor_queries": sql_editor,
+                 "ad_hoc_queries": ad_hoc, "partner_tools": partner_names},
     )
 
 
