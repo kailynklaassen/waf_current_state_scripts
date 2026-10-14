@@ -404,61 +404,74 @@ def pe_02_06(ctx: Ctx) -> Result:
 
 
 def pe_02_07(ctx: Ctx) -> Result:
-    """Understand your hardware and workload type."""
-    if not ctx.has_table("system.compute.node_timeline"):
+    """Understand your hardware and workload type.
+
+    Rolls the query-level performance signals up to the compute resource and counts how
+    many resources (jobs / warehouses / clusters) show a recurring hardware-fit problem.
+    A resource is flagged when a material share (default 20%) of a meaningful number of
+    its queries (default >= 20) spill to disk (memory too small) or queue at capacity
+    (compute too small) - the two signals that point at the wrong hardware/size. Shuffle-
+    heavy is a query-shape issue, not a hardware one, so it is excluded here.
+
+    Status is the COUNT of flagged resources:  < 5 completed, 5-20 in-progress, > 20 open.
+    All thresholds are config-overridable.
+    """
+    if not ctx.has_table("system.query.history"):
         return Result(
             "PE-02-07", "", "", "", STATUS_OPEN,
-            "system.compute.node_timeline is not readable, so hardware fit cannot be "
-            "assessed.",
+            "system.query.history is not readable, so workloads with performance issues "
+            "cannot be identified.",
         )
+    share = float(ctx.cfg.get("perf_issue_share", 0.20))
+    min_q = int(ctx.cfg.get("perf_issue_min_queries", 20))
+    inprog_at = int(ctx.cfg.get("perf_issue_inprogress_at", 5))
+    open_at = int(ctx.cfg.get("perf_issue_open_at", 20))
     row = ctx.one(
-        """
-        SELECT count(DISTINCT cluster_id) AS clusters,
-               avg(cpu_user_percent + cpu_system_percent) AS avg_cpu,
-               avg(mem_used_percent) AS avg_mem,
-               avg(coalesce(cpu_wait_percent, 0)) AS avg_iowait,
-               avg(coalesce(mem_swap_percent, 0)) AS avg_swap
-        FROM system.compute.node_timeline
-        WHERE start_time >= current_timestamp() - INTERVAL 30 DAYS
+        f"""
+        WITH q AS (
+          SELECT coalesce(query_source.job_info.job_id, compute.warehouse_id,
+                          compute.cluster_id) AS rid,
+                 CASE WHEN query_source.job_info.job_id IS NOT NULL THEN 'job'
+                      WHEN compute.cluster_id IS NOT NULL THEN 'cluster'
+                      ELSE 'warehouse' END AS rtype,
+                 CASE WHEN coalesce(spilled_local_bytes, 0) > 0
+                           OR coalesce(waiting_at_capacity_duration_ms, 0) > 0
+                      THEN 1 ELSE 0 END AS bad
+          FROM system.query.history
+          WHERE start_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
+            AND execution_status = 'FINISHED'
+            AND coalesce(query_source.job_info.job_id, compute.warehouse_id,
+                         compute.cluster_id) IS NOT NULL
+        ),
+        agg AS (SELECT rid, rtype, count(*) AS tot, sum(bad) AS bad FROM q GROUP BY 1, 2),
+        flagged AS (SELECT rtype FROM agg WHERE tot >= {min_q} AND bad * 1.0 / tot >= {share})
+        SELECT count(*) AS flagged,
+               count_if(rtype = 'job') AS jobs,
+               count_if(rtype = 'warehouse') AS warehouses,
+               count_if(rtype = 'cluster') AS clusters
+        FROM flagged
         """
     )
+    flagged = int(row.get("flagged") or 0)
+    jobs = int(row.get("jobs") or 0)
+    warehouses = int(row.get("warehouses") or 0)
     clusters = int(row.get("clusters") or 0)
-    if clusters == 0:
-        return Result(
-            "PE-02-07", "", "", "", STATUS_OPEN,
-            "No node utilization telemetry in the last 30 days, so hardware fit cannot "
-            "be assessed.",
-        )
-    cpu = float(row.get("avg_cpu") or 0)
-    mem = float(row.get("avg_mem") or 0)
-    iowait = float(row.get("avg_iowait") or 0)
-    swap = float(row.get("avg_swap") or 0)
-
-    problems = []
-    if swap > 1:
-        problems.append(f"memory pressure (avg swap {swap:.1f}%, use memory-optimized nodes)")
-    if iowait > 20:
-        problems.append(f"IO bound (avg CPU wait {iowait:.1f}%, consider storage-optimized nodes)")
-    if mem > 90:
-        problems.append(f"high memory use ({mem:.1f}%)")
-    if cpu < 20:
-        problems.append(f"low CPU use ({cpu:.1f}%), suggesting oversized or idle compute")
-
-    if problems:
-        return Result(
-            "PE-02-07", "", "", "", STATUS_IN_PROGRESS,
-            f"Across {clusters} cluster(s) over 30 days the hardware profile shows: "
-            + "; ".join(problems)
-            + f". Averages: CPU {cpu:.1f}%, memory {mem:.1f}%, IO wait {iowait:.1f}%.",
-            {"clusters": clusters, "avg_cpu_pct": round(cpu, 2),
-             "avg_mem_pct": round(mem, 2), "avg_iowait_pct": round(iowait, 2),
-             "avg_swap_pct": round(swap, 2)},
-        )
+    if flagged > open_at:
+        status = STATUS_OPEN
+    elif flagged >= inprog_at:
+        status = STATUS_IN_PROGRESS
+    else:
+        status = STATUS_COMPLETED
     return Result(
-        "PE-02-07", "", "", "", STATUS_COMPLETED,
-        f"Hardware appears matched to the workload across {clusters} cluster(s): "
-        f"CPU {cpu:.1f}%, memory {mem:.1f}%, IO wait {iowait:.1f}%, negligible swap.",
-        {"clusters": clusters, "avg_cpu_pct": round(cpu, 2), "avg_mem_pct": round(mem, 2)},
+        "PE-02-07", "", "", "", status,
+        f"{flagged} compute resource(s) show recurring performance issues "
+        f"(>= {share * 100:.0f}% of at least {min_q} queries spilling to disk or queuing "
+        f"at capacity) in the last {ctx.lookback_days} days: {jobs} job(s), "
+        f"{warehouses} warehouse(s), {clusters} cluster(s). Bands: <{inprog_at} completed, "
+        f"{inprog_at}-{open_at} in-progress, >{open_at} open. Flagged workloads likely "
+        "need a larger or differently-shaped instance type.",
+        {"flagged_resources": flagged, "jobs": jobs, "warehouses": warehouses,
+         "clusters": clusters, "issue_share": share, "min_queries": min_q},
     )
 
 

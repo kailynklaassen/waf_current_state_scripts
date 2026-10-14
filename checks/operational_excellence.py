@@ -39,6 +39,14 @@ def _sdk_count(ctx: Ctx, attr: str, sub: str = "list") -> int | None:
 _TERRAFORM_UA = r"(terraform|pulumi|cdk)"
 _API_UA = r"(databricks-sdk|databricks-cli|python-requests|go-http|okhttp)"
 
+#: metric-name tokens that identify LLM-as-judge / GenAI quality metrics in
+#: system.mlflow.run_metrics_history (verified present on this account: correctness,
+#: safety, relevance, groundedness, retrieval, guideline, hallucination judges, ...).
+_LLM_JUDGE_RE = (
+    r"(correctness|safety|relevance|grounded|faithful|guideline|toxic|judge|hallucinat|"
+    r"coherence|answer_|context_|retrieval|chunk_relevance|expectation)"
+)
+
 
 def _jobs_managed_as_code(ctx: Ctx) -> dict[str, int | bool]:
     """How many active jobs are managed as code rather than clicked together in the UI.
@@ -394,44 +402,83 @@ def oe_01_07(ctx: Ctx) -> Result:
 
 
 def oe_01_08(ctx: Ctx) -> Result:
-    """Compare LLM outputs on set prompts."""
-    evals = 0
-    if ctx.has_table("system.mlflow.runs_latest"):
-        evals = ctx.count_safe(
-            f"""
-            SELECT count(*) AS n FROM system.mlflow.runs_latest
-            WHERE delete_time IS NULL
-              AND start_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-              AND (lower(coalesce(run_name, '')) RLIKE '(eval|judge|benchmark)'
-                   OR lower(coalesce(to_json(tags), '')) RLIKE '(evaluation|mlflow.evaluate|judge)')
-            """
-        )
-    metrics_rows = 0
-    if ctx.has_table("system.mlflow.run_metrics_history"):
-        metrics_rows = ctx.count_safe(
-            f"""
-            SELECT count(*) AS n FROM system.mlflow.run_metrics_history
-            WHERE metric_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-              AND lower(coalesce(metric_name, '')) RLIKE
-                  '(toxicity|relevance|faithful|correctness|groundedness|answer_|rouge|bleu|judge)'
-            """
-        )
-    if evals == 0 and metrics_rows == 0:
+    """Compare LLM outputs on set prompts.
+
+    Measured from LLM-as-judge metrics logged to MLflow (system.mlflow.
+    run_metrics_history). "Comparing outputs on a set of prompts" properly means
+    scoring across several quality dimensions, so:
+      - no judge metrics            -> open (outputs not evaluated with judges)
+      - judged on one dimension     -> in-progress (narrow)
+      - judged on >= 2 dimensions   -> completed (multi-dimensional LLM eval in use)
+    """
+    if not ctx.has_table("system.mlflow.run_metrics_history"):
         return Result(
             "OE-01-08", "", "", "", STATUS_OPEN,
-            f"No LLM evaluation runs or GenAI quality metrics found in the last "
+            "system.mlflow.run_metrics_history is not readable, so LLM-as-judge "
+            "evaluation cannot be assessed.",
+        )
+    row = ctx.one(
+        f"""
+        WITH judged AS (
+          SELECT DISTINCT run_id,
+            CASE
+              WHEN lower(metric_name) RLIKE '(correctness|answer_)' THEN 'correctness'
+              WHEN lower(metric_name) RLIKE '(safety|toxic)' THEN 'safety'
+              WHEN lower(metric_name) RLIKE 'relevance' THEN 'relevance'
+              WHEN lower(metric_name) RLIKE '(grounded|faithful|hallucinat)' THEN 'groundedness'
+              WHEN lower(metric_name) RLIKE '(guideline|expectation)' THEN 'guideline'
+              WHEN lower(metric_name) RLIKE '(retrieval|context_|chunk)' THEN 'retrieval'
+              ELSE 'other' END AS dim
+          FROM system.mlflow.run_metrics_history
+          WHERE metric_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
+            AND lower(coalesce(metric_name, '')) RLIKE '{_LLM_JUDGE_RE}'
+        )
+        SELECT count(DISTINCT run_id) AS runs,
+               count(DISTINCT dim) AS dims,
+               array_join(array_sort(collect_set(dim)), ', ') AS dim_list
+        FROM judged
+        """
+    )
+    runs = int(row.get("runs") or 0)
+    dims = int(row.get("dims") or 0)
+    dim_list = row.get("dim_list") or ""
+    experiments = 0
+    if runs and ctx.has_table("system.mlflow.runs_latest"):
+        experiments = ctx.count_safe(
+            f"""
+            WITH judged AS (
+              SELECT DISTINCT run_id FROM system.mlflow.run_metrics_history
+              WHERE metric_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
+                AND lower(coalesce(metric_name, '')) RLIKE '{_LLM_JUDGE_RE}'
+            )
+            SELECT count(DISTINCT rl.experiment_id) AS n
+            FROM system.mlflow.runs_latest rl JOIN judged j ON rl.run_id = j.run_id
+            WHERE rl.delete_time IS NULL
+            """
+        )
+    if runs == 0:
+        return Result(
+            "OE-01-08", "", "", "", STATUS_OPEN,
+            f"No LLM-as-judge evaluation metrics were logged in the last "
             f"{ctx.lookback_days} days, so model outputs are not being compared "
             "systematically. Mark ignore in the WAF tool if GenAI is out of scope.",
-            {"evaluation_runs": 0, "quality_metrics": 0},
+            {"judge_runs": 0, "judge_dimensions": 0},
         )
-    status = STATUS_COMPLETED if metrics_rows > 0 else STATUS_OPEN
+    status = STATUS_COMPLETED if dims >= 2 else STATUS_IN_PROGRESS
+    tail = (
+        "Multiple quality dimensions are scored, a proper multi-faceted comparison."
+        if dims >= 2
+        else "Only one quality dimension is scored - broaden to several (correctness, "
+             "safety, relevance, groundedness) for a proper comparison."
+    )
     return Result(
         "OE-01-08", "", "", "", status,
-        f"LLM output comparison is not systematically measured: {evals:,} evaluation-tagged "
-        f"run(s) found but no GenAI quality metrics were logged in the last "
-        f"{ctx.lookback_days} days. Comparisons may be manual or informal without "
-        "repeatable scored metrics.",
-        {"evaluation_runs": evals, "quality_metrics": 0},
+        f"LLM outputs are evaluated with judges: {runs:,} eval run(s)"
+        + (f" across {experiments} experiment(s)" if experiments else "")
+        + f" covering {dims} quality dimension(s) ({dim_list}) in the last "
+        f"{ctx.lookback_days} days. {tail}",
+        {"judge_runs": runs, "judge_experiments": experiments,
+         "judge_dimensions": dims, "dimensions": dim_list},
     )
 
 
@@ -932,63 +979,62 @@ def oe_02_10(ctx: Ctx) -> Result:
 
 
 def oe_02_11(ctx: Ctx) -> Result:
-    """Automate LLM evaluation."""
-    eval_jobs = 0
-    if ctx.has_table("system.lakeflow.jobs"):
-        eval_jobs = ctx.count_safe(
-            """
-            WITH latest AS (
-              SELECT job_id, name,
-                     row_number() OVER (PARTITION BY job_id ORDER BY change_time DESC) AS rn
-              FROM system.lakeflow.jobs WHERE delete_time IS NULL
-            )
-            SELECT count(*) AS n FROM latest
-            WHERE rn = 1 AND lower(coalesce(name, '')) RLIKE '(eval|judge|benchmark|quality)'
-            """
-        )
-    metrics_rows = 0
-    if ctx.has_table("system.mlflow.run_metrics_history"):
-        metrics_rows = ctx.count_safe(
-            f"""
-            SELECT count(*) AS n FROM system.mlflow.run_metrics_history
-            WHERE metric_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-              AND lower(coalesce(metric_name, '')) RLIKE
-                  '(toxicity|relevance|faithful|correctness|groundedness|answer_|judge)'
-            """
-        )
-    endpoints = 0
-    if ctx.has_table("system.serving.served_entities"):
-        endpoints = ctx.count_safe(
-            """
-            SELECT count(DISTINCT endpoint_id) AS n FROM system.serving.served_entities
-            WHERE endpoint_delete_time IS NULL
-              AND (foundation_model_config IS NOT NULL OR external_model_config IS NOT NULL)
-            """
-        )
-    if endpoints == 0 and eval_jobs == 0 and metrics_rows == 0:
+    """Automate LLM evaluation.
+
+    Of the LLM-as-judge evaluation runs that happened, what share were triggered by a
+    scheduled job (automated) rather than run interactively? A run is automated when its
+    MLflow source type is JOB (or it carries a Databricks job tag). No judge-eval runs at
+    all -> open (nothing is being evaluated to automate).
+    """
+    if not (ctx.has_table("system.mlflow.run_metrics_history")
+            and ctx.has_table("system.mlflow.runs_latest")):
         return Result(
             "OE-02-11", "", "", "", STATUS_OPEN,
-            "No LLM endpoints, evaluation jobs, or GenAI quality metrics found, so there "
-            "is no automated LLM evaluation. Mark ignore in the WAF tool if GenAI is out "
-            "of scope.",
-            {"eval_jobs": 0, "quality_metrics": 0, "llm_endpoints": 0},
+            "system.mlflow.run_metrics_history / runs_latest are not readable, so "
+            "automated LLM evaluation cannot be assessed.",
         )
-    if eval_jobs == 0:
+    row = ctx.one(
+        f"""
+        WITH judged AS (
+          SELECT DISTINCT run_id FROM system.mlflow.run_metrics_history
+          WHERE metric_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
+            AND lower(coalesce(metric_name, '')) RLIKE '{_LLM_JUDGE_RE}'
+        ),
+        r AS (
+          SELECT coalesce(
+                   element_at(rl.tags, 'mlflow.source.type'),
+                   CASE WHEN element_at(rl.tags, 'mlflow.databricks.jobID') IS NOT NULL
+                        THEN 'JOB' END,
+                   'OTHER') AS source_type
+          FROM system.mlflow.runs_latest rl JOIN judged j ON rl.run_id = j.run_id
+          WHERE rl.delete_time IS NULL
+        )
+        SELECT count(*) AS judge_runs, count_if(source_type = 'JOB') AS automated
+        FROM r
+        """
+    )
+    judge_runs = int(row.get("judge_runs") or 0)
+    automated = int(row.get("automated") or 0)
+    if judge_runs == 0:
         return Result(
             "OE-02-11", "", "", "", STATUS_OPEN,
-            f"No scheduled LLM evaluation job was found, so LLM evaluation is not "
-            f"automated. While {endpoints} LLM endpoint(s) and {metrics_rows:,} quality "
-            f"metric record(s) exist, automated scheduled evaluation requires a configured "
-            "evaluation job.",
-            {"eval_jobs": 0, "quality_metrics": metrics_rows, "llm_endpoints": endpoints},
+            f"No LLM-as-judge evaluation runs were found in the last {ctx.lookback_days} "
+            "days, so there is no LLM evaluation to automate. Mark ignore in the WAF tool "
+            "if GenAI is out of scope.",
+            {"judge_runs": 0, "automated_runs": 0},
         )
-    return Result(
-        "OE-02-11", "", "", "", STATUS_COMPLETED,
-        f"LLM evaluation is automated: {eval_jobs} scheduled evaluation job(s) and "
-        f"{metrics_rows:,} quality metric record(s) in the last {ctx.lookback_days} days "
-        f"across {endpoints} LLM endpoint(s).",
-        {"eval_jobs": eval_jobs, "quality_metrics": metrics_rows,
-         "llm_endpoints": endpoints},
+    return ratio_result(
+        "OE-02-11",
+        automated,
+        judge_runs,
+        f"LLM-as-judge evaluation runs in the last {ctx.lookback_days} days were "
+        "triggered by a scheduled job (automated) rather than run interactively",
+        complete_at=ctx.complete_at,
+        extra=(
+            f"{automated:,} of {judge_runs:,} judge-eval runs are job-triggered; the "
+            "remainder are interactive/manual."
+        ),
+        metrics={"judge_runs": judge_runs, "automated_runs": automated},
     )
 
 
