@@ -40,6 +40,17 @@ def _admin_identities(ctx: Ctx) -> set[str] | None:
 PILLAR_ID = "data-ai-governance"
 
 
+def _meaningful_comment_sql(col: str, min_len: int) -> str:
+    """SQL predicate for a comment that is a real description, not blank or a
+    placeholder (``todo``, ``n/a``, ``-`` ...). Presence of *some* text is not
+    documentation; require a minimum length and reject common filler."""
+    return (
+        f"{col} IS NOT NULL AND length(trim({col})) >= {min_len} "
+        f"AND lower(trim({col})) NOT RLIKE "
+        "'^(todo|tbd|tbc|n/?a|none|null|xxx+|placeholder|no comment|no description)$'"
+    )
+
+
 # ----------------------------------------------------------------------------------
 # Unify data and AI management
 # ----------------------------------------------------------------------------------
@@ -64,11 +75,13 @@ def dg_01_02(ctx: Ctx) -> Result:
     production because that is where governance matters most.
     """
     scope = ctx.scope
+    min_len = int(ctx.cfg.get("comment_min_length", 10))
+    meaningful = _meaningful_comment_sql("comment", min_len)
     row = ctx.one(
         f"""
         SELECT
           count(*) AS total,
-          count_if(comment IS NOT NULL AND trim(comment) <> '') AS documented,
+          count_if({meaningful}) AS documented,
           count_if(table_owner IS NOT NULL AND trim(table_owner) <> '') AS owned
         FROM system.information_schema.tables
         WHERE {scope.predicate()}
@@ -83,8 +96,8 @@ def dg_01_02(ctx: Ctx) -> Result:
         "DG-01-02",
         documented,
         total,
-        f"{scope.label} tables are registered in Unity Catalog with a table-level "
-        "description maintained",
+        f"{scope.label} tables carry a meaningful table-level description "
+        f"(>= {min_len} chars, not a placeholder)",
         complete_at=ctx.complete_at,
         none_found=(
             "No tables found in the assessed catalogs, so there is no evidence that "
@@ -238,10 +251,12 @@ def dg_01_03(ctx: Ctx) -> Result:
 def dg_01_04(ctx: Ctx) -> Result:
     """Add consistent descriptions to your metadata (column-level comments)."""
     scope = ctx.scope
+    min_len = int(ctx.cfg.get("comment_min_length", 10))
+    meaningful = _meaningful_comment_sql("comment", min_len)
     row = ctx.one(
         f"""
         SELECT count(*) AS total,
-               count_if(comment IS NOT NULL AND trim(comment) <> '') AS documented
+               count_if({meaningful}) AS documented
         FROM system.information_schema.columns
         WHERE {scope.predicate()}
         """
@@ -252,7 +267,8 @@ def dg_01_04(ctx: Ctx) -> Result:
         "DG-01-04",
         documented,
         total,
-        f"columns in {scope.label} carry a description",
+        f"columns in {scope.label} carry a meaningful description (>= {min_len} chars, "
+        "not a placeholder)",
         complete_at=ctx.complete_at,
         none_found="No columns found in the assessed catalogs.",
         extra="AI-generated comments can bulk-populate these in Catalog Explorer.",
@@ -351,17 +367,23 @@ def dg_01_06(ctx: Ctx) -> Result:
             {"experiments": ws_experiments, "scoped": True},
         )
 
-    status = STATUS_COMPLETED if models_n > 0 else STATUS_OPEN
-    reason = (
-        f"{models_n} model(s) registered in Unity Catalog and {uc_functions} UC "
-        f"function(s) governed alongside data ({ws_experiments} MLflow experiment(s) "
-        "tracked)."
-    )
-    if models_n == 0:
+    # Governing AI assets alongside data means BOTH models and functions live in UC -
+    # they are co-equal signals, not a model-only gate.
+    if models_n > 0 and uc_functions > 0:
+        status = STATUS_COMPLETED
         reason = (
-            f"No adoption of UC model governance was observed (0 UC-registered models); "
-            f"{uc_functions} UC function(s) and {ws_experiments} MLflow experiment(s) exist, "
-            "but models should be registered in Unity Catalog to govern AI assets alongside data."
+            f"AI assets are governed in Unity Catalog alongside data: {models_n} "
+            f"registered model(s) and {uc_functions} UC function(s) "
+            f"({ws_experiments} MLflow experiment(s) tracked)."
+        )
+    else:
+        status = STATUS_IN_PROGRESS
+        missing = "UC-registered models" if models_n == 0 else "UC functions"
+        reason = (
+            f"AI governance in Unity Catalog is partial: {models_n} registered model(s) "
+            f"and {uc_functions} UC function(s) ({ws_experiments} MLflow experiment(s) "
+            f"tracked). Both models and functions should be governed in UC - {missing} "
+            "are absent."
         )
     return Result(
         "DG-01-06", "", "", "", status, reason,
@@ -453,7 +475,8 @@ def dg_02_02(ctx: Ctx) -> Result:
         f"""
         SELECT count(*) AS events,
                count(DISTINCT event_date) AS days,
-               max(event_date) AS last_day
+               max(event_date) AS last_day,
+               datediff(current_date(), min(event_date)) + 1 AS span_days
         FROM system.access.audit
         WHERE event_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
         """
@@ -467,14 +490,23 @@ def dg_02_02(ctx: Ctx) -> Result:
             f"{ctx.lookback_days} days.",
             {"lookback_days": ctx.lookback_days},
         )
+    # Grace period: if logging was only enabled part-way through the window, measure
+    # coverage against the days since it started, not the full lookback - otherwise a
+    # freshly-enabled (but healthy) audit log scores near zero.
+    span = int(row.get("span_days") or ctx.lookback_days)
+    denom = max(1, min(ctx.lookback_days, span))
+    recent = denom < ctx.lookback_days
     return ratio_result(
         "DG-02-02",
         days,
-        ctx.lookback_days,
-        f"days in the last {ctx.lookback_days} have audit coverage",
+        denom,
+        (f"days since audit logging first appeared ({denom} day(s)) have audit coverage"
+         if recent else f"days in the last {ctx.lookback_days} have audit coverage"),
         complete_at=ctx.complete_at,
-        extra=f"{events:,} audit events captured; most recent {row.get('last_day')}.",
-        metrics={"events": events},
+        extra=(f"{events:,} audit events captured; most recent {row.get('last_day')}."
+               + (" Audit logging appears to have been enabled recently, so coverage is "
+                  "measured from its start." if recent else "")),
+        metrics={"events": events, "coverage_window_days": denom},
     )
 
 
@@ -486,17 +518,23 @@ def dg_02_03(ctx: Ctx) -> Result:
             "system.access.audit is not readable, so platform events are not being "
             "audited.",
         )
-    consumers = 0
-    queries = 0
-    if ctx.has_table("system.query.history"):
+    # "Actively reviewed" is a cadence, not a single query: score the share of weeks in
+    # the window that had at least one query against the audit log (like DG-01-03 usage).
+    total_weeks = max(1, -(-ctx.lookback_days // 7))  # ceil(days / 7)
+    active_weeks = queries = consumers = 0
+    history = ctx.has_table("system.query.history")
+    if history:
         row = ctx.one(
             f"""
-            SELECT count(*) AS queries, count(DISTINCT executed_by) AS consumers
+            SELECT count(DISTINCT date_trunc('WEEK', start_time)) AS active_weeks,
+                   count(*) AS queries,
+                   count(DISTINCT executed_by) AS consumers
             FROM system.query.history
             WHERE start_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
               AND lower(statement_text) LIKE '%system.access.audit%'
             """
         )
+        active_weeks = int(row.get("active_weeks") or 0)
         queries = int(row.get("queries") or 0)
         consumers = int(row.get("consumers") or 0)
 
@@ -506,21 +544,26 @@ def dg_02_03(ctx: Ctx) -> Result:
         WHERE event_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
         """
     )
-    if queries == 0:
-        return Result(
-            "DG-02-03", "", "", "", STATUS_OPEN,
-            f"No adoption of audit log review was observed (0 queries against system.access.audit in "
-            f"the last {ctx.lookback_days} days). Audit data is available ({unique_actions} distinct "
-            "action types collected) but no evidence that the logs are actively reviewed.",
-            {"unique_actions": unique_actions, "audit_queries": 0},
+    extra = (
+        f"{queries:,} query/queries by {consumers} principal(s) across {unique_actions} "
+        "audited action type(s)."
+    )
+    if not history:
+        extra += (
+            " system.query.history is not readable, so review activity could not be "
+            "measured and is counted as zero."
         )
-    return Result(
-        "DG-02-03", "", "", "", STATUS_COMPLETED,
-        f"Audit logs are actively reviewed: {queries:,} query/queries against "
-        f"system.access.audit by {consumers} distinct principal(s) in the last "
-        f"{ctx.lookback_days} days, across {unique_actions} audited action types.",
-        {"unique_actions": unique_actions, "audit_queries": queries,
-         "audit_consumers": consumers},
+    return ratio_result(
+        "DG-02-03",
+        active_weeks,
+        total_weeks,
+        f"weeks in the last {ctx.lookback_days} days had at least one review query "
+        "against system.access.audit (audit logs actively reviewed, not just collected)",
+        complete_at=ctx.complete_at,
+        extra=extra,
+        metrics={"unique_actions": unique_actions, "audit_queries": queries,
+                 "audit_consumers": consumers, "active_weeks": active_weeks,
+                 "total_weeks": total_weeks},
     )
 
 
@@ -607,16 +650,21 @@ def dg_03_02(ctx: Ctx) -> Result:
 def dg_03_03(ctx: Ctx) -> Result:
     """Implement and enforce standardized data formats and definitions."""
     scope = ctx.scope
+    # The "standard" format is config-driven: Delta is the default, but an environment
+    # that standardized on Iceberg/Parquet shouldn't be scored as non-compliant.
+    formats = [f.lower() for f in
+               (ctx.cfg.get("standard_table_formats") or ["delta", "deltasharing"])]
+    quoted = ", ".join("'" + f.replace("'", "''") + "'" for f in formats)
     row = ctx.one(
         f"""
         SELECT count(*) AS total,
-               count_if(lower(coalesce(data_source_format, '')) IN ('delta', 'deltasharing')) AS delta
+               count_if(lower(coalesce(data_source_format, '')) IN ({quoted})) AS standard
         FROM system.information_schema.tables
         WHERE {scope.predicate()} AND table_type <> 'VIEW'
         """
     )
     total = int(row.get("total") or 0)
-    delta = int(row.get("delta") or 0)
+    standard = int(row.get("standard") or 0)
     fmt_rows = ctx.sql(
         f"""
         SELECT coalesce(data_source_format, 'UNKNOWN') AS fmt, count(*) AS n
@@ -628,13 +676,14 @@ def dg_03_03(ctx: Ctx) -> Result:
     mix = ", ".join(f"{r['fmt']}={r['n']}" for r in fmt_rows)
     return ratio_result(
         "DG-03-03",
-        delta,
+        standard,
         total,
-        f"{scope.label} tables use the standardized Delta format",
+        f"{scope.label} tables use the standardized format(s) ({', '.join(formats)})",
         complete_at=ctx.complete_at,
         none_found="No tables found in the assessed catalogs.",
         extra=f"Format mix: {mix}." if mix else "",
-        metrics={"format_mix": {r["fmt"]: r["n"] for r in fmt_rows}, "scoped": True},
+        metrics={"format_mix": {r["fmt"]: r["n"] for r in fmt_rows},
+                 "standard_formats": formats, "scoped": True},
     )
 
 
