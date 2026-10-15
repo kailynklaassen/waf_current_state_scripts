@@ -1,4 +1,9 @@
 __pycache__/
-*.pyc
+*.py[cod]
 .ipynb_checkpoints/
+.DS_Store
+.venv/
+venv/
+out/
+*.egg-info/
 /tmp_*

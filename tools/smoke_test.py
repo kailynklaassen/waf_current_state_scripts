@@ -5,7 +5,7 @@ This is a *syntax and permissions* smoke test, run from a laptop without a clust
 It swaps ``Ctx.sql`` for an implementation backed by
 ``databricks experimental aitools tools query``, so every SQL statement in every
 check is really parsed and executed by Databricks SQL. Statuses produced here
-reflect the test workspace, not a customer, so only failures matter.
+reflect the test workspace, not your Databricks environment, so only failures matter.
 
 Usage:
     python tools/smoke_test.py --profile <PROFILE> [--pillar governance] [-v]
@@ -166,6 +166,9 @@ def default_cfg() -> dict:
         "lookback_days": 90,
         "complete_at": 0.80,
         "debug": True,
+        # Smoke test is read-only: query the lineage system tables directly rather than
+        # materializing a snapshot. Checks exercise the same SQL via the fallback path.
+        "materialize_lineage": False,
     }
 
 

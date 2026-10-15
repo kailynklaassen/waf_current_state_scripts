@@ -22,12 +22,34 @@ Privacy (38 questions) is not implemented — see [Coverage](#coverage).
    `PROD_CATALOG_PATTERNS`. Nothing runs until `CATALOG`/`SCHEMA` are filled in.
 3. Run `notebooks/99_run_all.ipynb`.
 
-That produces the combined report inline, a markdown file, a CSV, and a results table.
-To assess a single pillar, run that pillar's notebook instead — each one `%run`s the
-config itself.
+That produces the combined report inline, a markdown file, a JSON export (in the WAF
+Assessment Tool's format), a CSV, and a results table. To assess a single pillar, run that
+pillar's notebook instead — each one `%run`s the config itself.
 
 Requires serverless or a cluster on DBR 13.3 LTS or newer (the checks use
 `count_if`, `try_cast`, and lambda expressions).
+
+### Where the exports are saved
+
+By default, section **7. Export** in `99_run_all` saves the markdown, JSON, and CSV to a
+Unity Catalog Volume so they persist and can be governed and shared. The cell creates the
+Volume if it doesn't exist:
+
+```sql
+CREATE VOLUME IF NOT EXISTS <catalog>.<schema>.waf_exports;
+```
+
+and writes the three files to `/Volumes/<catalog>/<schema>/waf_exports/` (using the
+`CATALOG`/`SCHEMA` from `00_config`).
+
+To change this, edit the top of the export cell:
+
+- **`VOLUME_NAME = "waf_exports"`** — rename the Volume the exports are written to.
+- **`USE_VOLUME = True`** — set to `False` to write to `/tmp` on the driver instead
+  (ephemeral, but downloadable from the UI).
+
+If the Volume can't be created (for example, missing privileges on the catalog/schema), the
+cell falls back to `/tmp` and prints a note rather than failing the run.
 
 ## Status vocabulary
 
@@ -60,9 +82,12 @@ Rules applied consistently across all pillars:
 
 - **Nothing found is `open`, not a pass.** An empty denominator means no evidence of
   adoption, so it never scores `completed`.
-- **0 of N is `in-progress`, not `open`.** If assets exist but none are covered, that is
-  a measured 0% — different from having nothing to measure.
-- **`>= 80%` is `completed`, below is `in-progress`.** Tunable via `COMPLETE_AT`. A few
+- **0 of N is `open`, not `in-progress`.** A measured zero is no adoption of the control,
+  so it is an open item. `in-progress` is reserved for genuine partial adoption — strictly
+  **more than 0** but below the threshold. A control whose capability exists but is used
+  zero times (collected-but-never-reviewed, defined-but-never-exercised) is `open` for the
+  same reason.
+- **`>= 80%` is `completed`, below (but above 0) is `in-progress`.** Tunable via `COMPLETE_AT`. A few
   checks use a deliberately lower bar where 80% would be wrong (for example file pruning
   at 50%, or declarative-pipeline adoption at 30%); those state their threshold in the
   rationale.
@@ -84,9 +109,9 @@ naming the evidence to collect, which doubles as an interview checklist:
 ```
 DG-01-01  [manual-review]  Establish data governance process
     Reason: Not determinable from system tables or APIs: a governance operating model
-            is an organizational process, not a platform setting. Ask the customer for:
-            the data governance charter, named data owners/stewards, and the policy
-            review cadence.
+            is an organizational process, not a platform setting. Gather from your
+            Databricks environment's owners: the data governance charter, named data
+            owners/stewards, and the policy review cadence.
 ```
 
 There are 6 such questions across the implemented pillars: `DG-01-01`, `DG-03-01`,
@@ -130,8 +155,16 @@ catalogs were assessed] 38.0% of ...
 Security is excluded deliberately rather than half-answered. Most of its 38 questions are
 account-console, identity-provider, or cloud-network settings (SSO, MFA, customer-managed
 keys, PrivateLink, VPC configuration) that a workspace-scoped script cannot observe, and
-guessing at them would produce confident, wrong answers about a customer's security
-posture. `99_run_all` names the pillar as unimplemented instead of quietly dropping it.
+guessing at them would produce confident, wrong answers about your Databricks
+environment's security posture. `99_run_all` names the pillar as unimplemented instead
+of quietly dropping it.
+
+For the Security, Compliance & Privacy pillar, run the
+[**Security Analysis Tool (SAT)**](https://databricks-industry-solutions.github.io/security-analysis-tool/docs/motivation/)
+instead. SAT is a Databricks solution accelerator that checks your workspace and account
+configuration against Databricks security best practices and produces a scored dashboard —
+exactly the account-console, identity, and network settings this tool cannot see. Use SAT
+for that pillar and transcribe its findings back into the WAF Assessment Tool.
 
 ## Repository layout
 
@@ -180,6 +213,31 @@ WHERE question_id = 'DG-01-02' ORDER BY run_timestamp DESC;
 Set `PERSIST_RESULTS = False` to run fully read-only; the report is then built from
 in-memory results for the current session only.
 
+### Lineage snapshot
+
+Several checks read `system.access.table_lineage` / `column_lineage`, which are large and
+would otherwise be re-scanned by each check. Instead, `00_config` materializes lineage once,
+up front, into the configured schema, following the pattern in
+[databricks_lineage](https://github.com/kailynklaassen/databricks_lineage):
+
+- **`waf_lineage_edges`** — deduped direct table-lineage edges (lookback-windowed), projected
+  to the columns the checks read.
+- **`waf_lineage_closure`** — the full transitive closure of `(trg_tbl, src_tbl)` pairs,
+  computed with the repo's iterative BFS "frontier + anti-join" loop (each hop materialized,
+  so known pairs are never re-derived and cycles can't loop).
+- **`waf_lineage_column_edges`** — deduped column-level edges.
+
+The lineage-heavy checks (`DG-01-03`, `DG-02-01`, `IU-04-03`, `R-02-05`) then read these small
+local tables instead of the system tables, so they run significantly faster. (The direct-edge
+tables answer the current checks' one-hop questions; the closure is materialized and exposed
+via `ctx.lineage_closure_table()` for multi-hop "all upstream sources" analysis.)
+
+Materialization is controlled by `MATERIALIZE_LINEAGE` in `00_config` (default `True`) and runs
+only when `PERSIST_RESULTS = True`. If it is skipped or can't be built — no write access to the
+catalog/schema, materialization disabled, or a read-only run — each check transparently falls
+back to the lineage system tables, so results are identical either way. The tables are rebuilt
+(`CREATE OR REPLACE`) on each run.
+
 ## Testing
 
 **Offline** — no workspace needed. Covers scoring thresholds, scope SQL generation
@@ -194,7 +252,7 @@ python tools/nbutil.py validate             # notebook JSON, syntax, no committe
 
 **Against a live workspace** — executes every check's real SQL through the Databricks
 CLI, so query syntax and permissions are verified without starting a cluster. Statuses it
-prints reflect the test workspace, not a customer, so only errors matter:
+prints reflect the test workspace, not your Databricks environment, so only errors matter:
 
 ```bash
 python tools/smoke_test.py --profile <PROFILE>                  # all pillars
@@ -223,8 +281,10 @@ grants, not missing controls.
 Checks degrade to `open` with an explanatory rationale when a schema is unavailable,
 rather than failing the run.
 
-**The assessment is read-only against customer data.** The only write is its own results
-table in the catalog and schema you configure.
+**The assessment is read-only against your Databricks environment's data.** Its only writes
+are to the catalog and schema you configure: its own results table and the lineage snapshot
+tables (`waf_lineage_edges`, `waf_lineage_column_edges`). With `PERSIST_RESULTS = False` it
+writes nothing at all.
 
 ## Regenerating the question bank
 
