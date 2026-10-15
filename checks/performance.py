@@ -672,6 +672,7 @@ def pe_02_11(ctx: Ctx) -> Result:
                  row_number() OVER (PARTITION BY table_id ORDER BY snapshot_date DESC) AS rn
           FROM system.storage.table_metrics_history
           WHERE table_dropped_time IS NULL
+            AND snapshot_date >= current_date() - INTERVAL 14 DAYS
             AND {scope.predicate('catalog_name', 'schema_name')}
         )
         SELECT count(*) AS total,
@@ -737,6 +738,7 @@ def pe_02_12(ctx: Ctx) -> Result:
                      row_number() OVER (PARTITION BY table_id ORDER BY snapshot_date DESC) AS rn
               FROM system.storage.table_metrics_history
               WHERE table_dropped_time IS NULL
+                AND snapshot_date >= current_date() - INTERVAL 14 DAYS
                 AND {scope.predicate('catalog_name', 'schema_name')}
             )
             SELECT count(*) AS n FROM latest
@@ -782,6 +784,7 @@ def pe_02_14(ctx: Ctx) -> Result:
                  row_number() OVER (PARTITION BY table_id ORDER BY snapshot_date DESC) AS rn
           FROM system.storage.table_metrics_history
           WHERE table_dropped_time IS NULL
+            AND snapshot_date >= current_date() - INTERVAL 14 DAYS
             AND {scope.predicate('catalog_name', 'schema_name')}
         ),
         sized AS (
@@ -1042,37 +1045,33 @@ def pe_04_01(ctx: Ctx) -> Result:
             "PE-04-01", "", "", "", STATUS_OPEN,
             "system.query.history is not readable, so query monitoring is not possible.",
         )
-    days = ctx.count(
+    # Active monitoring is a recurring practice, not a single ad-hoc query. Score the
+    # share of weeks that had at least one query against system.query.history.
+    total_weeks = max(1, -(-ctx.lookback_days // 7))  # ceil(days / 7)
+    row = ctx.one(
         f"""
-        SELECT count(DISTINCT date(start_time)) AS n FROM system.query.history
-        WHERE start_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-        """
-    )
-    watchers = ctx.count_safe(
-        f"""
-        SELECT count(*) AS n FROM system.query.history
+        SELECT count(DISTINCT date_trunc('WEEK', start_time)) AS active_weeks,
+               count(*) AS queries,
+               count(DISTINCT executed_by) AS watchers
+        FROM system.query.history
         WHERE start_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
           AND lower(statement_text) LIKE '%system.query.history%'
         """
     )
-    if days == 0:
-        return Result(
-            "PE-04-01", "", "", "", STATUS_OPEN,
-            f"No query history recorded in the last {ctx.lookback_days} days.",
-        )
-    if watchers == 0:
-        return Result(
-            "PE-04-01", "", "", "", STATUS_OPEN,
-            f"Query telemetry is available ({days} day(s) of history in the last "
-            f"{ctx.lookback_days}) but nobody has queried system.query.history, so no "
-            "active query performance monitoring is observed.",
-            {"history_days": days, "monitoring_queries": 0},
-        )
-    return Result(
-        "PE-04-01", "", "", "", STATUS_COMPLETED,
-        f"Query performance is actively monitored: {watchers:,} query/queries against "
-        f"system.query.history over {days} day(s) of available history.",
-        {"history_days": days, "monitoring_queries": watchers},
+    active_weeks = int(row.get("active_weeks") or 0)
+    queries = int(row.get("queries") or 0)
+    watchers = int(row.get("watchers") or 0)
+    return ratio_result(
+        "PE-04-01",
+        active_weeks,
+        total_weeks,
+        f"weeks in the last {ctx.lookback_days} days had query-performance monitoring (a "
+        "query against system.query.history), i.e. monitoring is a recurring practice "
+        "rather than a one-off",
+        complete_at=ctx.complete_at,
+        extra=f"{queries:,} monitoring query/queries by {watchers} distinct principal(s).",
+        metrics={"active_weeks": active_weeks, "total_weeks": total_weeks,
+                 "monitoring_queries": queries, "watchers": watchers},
     )
 
 

@@ -27,6 +27,13 @@ PILLAR_ID = "cost-optimization"
 #: so it never goes stale; override with an absolute bar via cfg["current_dbr_major"].
 DEFAULT_DBR_MAJOR_TOLERANCE = 2
 
+#: CO-01-07 current-generation instance-family tokens (substring match on node type).
+#: Config-overridable via cfg["modern_instance_families"]; broadened to current AWS gens.
+DEFAULT_MODERN_INSTANCE_FAMILIES = [
+    "c5", "c6", "c7", "c8", "d3", "d4", "d5", "e2", "e4", "e5", "i3", "i4", "im4", "is4",
+    "m5", "m6", "m7", "m8", "n2", "r5", "r6", "r7", "r8",
+]
+
 #: CO-03-03 chargeback tag-key tokens (RLIKE, case-insensitive). A billing record is
 #: "attributable" if any custom tag key matches one of these. Override in 00_config
 #: (cfg["chargeback_tag_patterns"]) to match the tag taxonomy an environment uses.
@@ -321,13 +328,14 @@ def co_01_07(ctx: Ctx) -> Result:
             {"clusters": 0},
         )
     total = sum(int(r["n"]) for r in rows)
-    # Latest-generation families are materially cheaper per unit of work.
+    # Latest-generation families are materially cheaper per unit of work. The family
+    # list is config-driven so it can track new instance generations.
+    fams = [f.lower() for f in
+            (ctx.cfg.get("modern_instance_families") or DEFAULT_MODERN_INSTANCE_FAMILIES)]
     modern = sum(
         int(r["n"])
         for r in rows
-        if any(tok in str(r["node_type"]).lower() for tok in
-               ("d3", "d4", "e4", "d5", "e5", "m5", "m6", "r5", "r6", "c5", "c6",
-                "i3en", "i4", "n2", "e2", "c3", "m7", "r7", "c7"))
+        if any(tok in str(r["node_type"]).lower() for tok in fams)
     )
     mix = ", ".join(f"{r['node_type']}={r['n']}" for r in rows)
     return ratio_result(
@@ -403,14 +411,15 @@ def co_01_09(ctx: Ctx) -> Result:
             "system.billing.usage is not readable, so Photon adoption cannot be "
             "measured.",
         )
+    # Score the authoritative Photon flag, not a sku_name string match, and don't lump
+    # SQL-warehouse DBU in as if it were the same engine - report it separately.
     row = ctx.one(
         f"""
         SELECT
           sum(usage_quantity) AS total,
-          sum(CASE WHEN product_features.is_photon = true
-                        OR lower(coalesce(sku_name, '')) LIKE '%photon%'
-                        OR lower(coalesce(sku_name, '')) LIKE '%sql%'
-                   THEN usage_quantity ELSE 0 END) AS vectorized
+          sum(CASE WHEN product_features.is_photon = true THEN usage_quantity ELSE 0 END) AS photon,
+          sum(CASE WHEN upper(coalesce(billing_origin_product, '')) IN ('SQL', 'DATABRICKS_SQL')
+                   THEN usage_quantity ELSE 0 END) AS sql_warehouse
         FROM system.billing.usage
         WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
         """
@@ -421,19 +430,22 @@ def co_01_09(ctx: Ctx) -> Result:
             "CO-01-09", "", "", "", STATUS_OPEN,
             f"No billable usage recorded in the last {ctx.lookback_days} days.",
         )
-    vectorized = float(row.get("vectorized") or 0)
+    photon = float(row.get("photon") or 0)
+    sql_wh = float(row.get("sql_warehouse") or 0)
     return ratio_result(
         "CO-01-09",
-        int(round(vectorized)),
+        int(round(photon)),
         int(round(total)),
-        f"DBUs in the last {ctx.lookback_days} days run on a vectorized engine "
-        "(Photon or SQL warehouse)",
+        f"DBUs in the last {ctx.lookback_days} days run on the Photon vectorized engine "
+        "(product_features.is_photon)",
         complete_at=ctx.complete_at,
         extra=(
+            f"SQL warehouse DBU (Photon-backed BI, counted separately): {sql_wh:,.0f}. "
             "Photon costs more per DBU but usually lowers total cost by finishing sooner; "
             "validate per workload."
         ),
-        metrics={"vectorized_dbus": round(vectorized, 2), "total_dbus": round(total, 2)},
+        metrics={"photon_dbus": round(photon, 2), "sql_warehouse_dbus": round(sql_wh, 2),
+                 "total_dbus": round(total, 2)},
     )
 
 

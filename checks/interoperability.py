@@ -308,12 +308,17 @@ def iu_01_04(ctx: Ctx) -> Result:
 def iu_02_01(ctx: Ctx) -> Result:
     """Use open data formats."""
     scope = ctx.scope
+    # Score only robust, structured open formats. CSV/JSON/text are open but schema-less
+    # with no ACID guarantees, so counting them as "open data formats" overstates the
+    # control - they are reported separately, not in the numerator.
     row = ctx.one(
         f"""
         SELECT count(*) AS total,
                count_if(lower(coalesce(data_source_format, '')) IN
-                        ('delta', 'deltasharing', 'parquet', 'iceberg', 'avro', 'orc', 'csv', 'json', 'text')) AS open_fmt,
-               count_if(lower(coalesce(data_source_format, '')) IN ('delta', 'deltasharing', 'iceberg')) AS open_table_fmt
+                        ('delta', 'deltasharing', 'parquet', 'iceberg', 'avro', 'orc')) AS open_fmt,
+               count_if(lower(coalesce(data_source_format, '')) IN
+                        ('delta', 'deltasharing', 'iceberg')) AS open_table_fmt,
+               count_if(lower(coalesce(data_source_format, '')) IN ('csv', 'json', 'text')) AS fragile
         FROM system.information_schema.tables
         WHERE {scope.predicate()} AND table_type <> 'VIEW'
         """
@@ -321,6 +326,7 @@ def iu_02_01(ctx: Ctx) -> Result:
     total = int(row.get("total") or 0)
     open_fmt = int(row.get("open_fmt") or 0)
     open_table = int(row.get("open_table_fmt") or 0)
+    fragile = int(row.get("fragile") or 0)
     proprietary = ctx.sql(
         f"""
         SELECT coalesce(data_source_format, 'UNKNOWN') AS fmt, count(*) AS n
@@ -335,22 +341,23 @@ def iu_02_01(ctx: Ctx) -> Result:
         "IU-02-01",
         open_fmt,
         total,
-        f"{scope.label} tables use an open format (Delta, Iceberg, Parquet, Avro, ORC or "
-        "text), avoiding vendor lock-in",
+        f"{scope.label} tables use a robust open format (Delta, Iceberg, Parquet, Avro or "
+        "ORC) that avoids vendor lock-in and carries a schema",
         complete_at=ctx.complete_at,
         none_found="No tables found in the assessed catalogs.",
         extra=(
-            f"{open_table} table(s) use an open *table* format (Delta or Iceberg) with "
-            "ACID guarantees."
+            f"{open_table} use an open *table* format (Delta/Iceberg) with ACID; "
+            f"{fragile} use schema-less CSV/JSON/text (open but not robust)."
             + (
-                " Non-open formats: "
+                " Proprietary/other: "
                 + ", ".join(f"{r['fmt']}={int(r['n'] or 0)}" for r in proprietary)
                 + "."
                 if proprietary
                 else ""
             )
         ),
-        metrics={"open_table_formats": open_table, "scoped": True},
+        metrics={"open_table_formats": open_table, "fragile_formats": fragile,
+                 "scoped": True},
     )
 
 
@@ -486,14 +493,18 @@ def iu_03_01(ctx: Ctx) -> Result:
             "adoption cannot be assessed.",
             {"active_principals": 0, "policies": policies},
         )
+    # Self-service has two orthogonal halves that must BOTH be present: self-provisioned
+    # COMPUTE (cluster policies) and self-served DATA access (schema read grants).
+    compute_ss = bool(policies)
+    data_ss = catalogs_readable > 0
     signals = []
-    if policies:
+    if compute_ss:
         signals.append(f"{policies} cluster policy/policies letting users self-provision compute safely")
-    if catalogs_readable:
+    if data_ss:
         signals.append(f"{catalogs_readable} principal(s) hold schema-level read grants")
-    if len(signals) >= 2:
+    if compute_ss and data_ss:
         status = STATUS_COMPLETED
-    elif len(signals) == 1:
+    elif compute_ss or data_ss:
         status = STATUS_IN_PROGRESS
     else:
         status = STATUS_OPEN
