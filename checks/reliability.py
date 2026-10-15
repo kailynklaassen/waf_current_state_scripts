@@ -436,54 +436,34 @@ def r_02_02(ctx: Ctx) -> Result:
 
 
 def r_02_03(ctx: Ctx) -> Result:
-    """Actively manage schemas (schema enforcement / evolution)."""
-    if not ctx.has_table("system.access.audit"):
-        return Result(
-            "R-02-03", "", "", "", STATUS_OPEN,
-            "system.access.audit is not readable, so schema change management cannot "
-            "be observed.",
-        )
-    row = ctx.one(
-        f"""
-        SELECT
-          count_if(action_name IN ('createTable', 'commandSubmit') ) AS creates,
-          count_if(lower(coalesce(request_params.statement, '')) LIKE '%alter table%'
-                   OR action_name = 'updateTable') AS alters
-        FROM system.access.audit
-        WHERE event_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
-          AND service_name IN ('unityCatalog', 'notebook', 'databrickssql')
-        """
-    )
-    alters = int(row.get("alters") or 0)
-    scope = ctx.scope
-    typed = ctx.one(
-        f"""
-        SELECT count(*) AS total,
-               count_if(is_nullable = 'NO') AS not_null
-        FROM system.information_schema.columns
-        WHERE {scope.predicate()}
-        """
-    )
-    total_cols = int(typed.get("total") or 0)
-    not_null = int(typed.get("not_null") or 0)
+    """Actively manage schemas (schema enforcement / evolution).
 
-    if total_cols == 0:
-        return Result(
-            "R-02-03", "", "", "", STATUS_OPEN,
-            "No columns found in the assessed catalogs, so schema management cannot "
-            "be assessed.",
-            {"scoped": True},
+    Delta enforces schema on write automatically, so "actively managing schemas" is
+    really a process question - are schema changes reviewed, and is evolution governed? -
+    that telemetry cannot confirm. The previous NOT-NULL-coverage proxy was both weak
+    (NOT NULL is a modelling choice, not evidence of management) and a performance risk
+    (full information_schema.columns scan). We report the cheap, directly-relevant audit
+    signal (ALTER activity) as context and leave the judgement to a human.
+    """
+    alters = 0
+    if ctx.has_table("system.access.audit"):
+        alters = ctx.count_safe(
+            f"""
+            SELECT count(*) AS n FROM system.access.audit
+            WHERE event_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+              AND service_name IN ('unityCatalog', 'notebook', 'databrickssql')
+              AND (lower(coalesce(request_params.statement, '')) LIKE '%alter table%'
+                   OR action_name = 'updateTable')
+            """
         )
-    pct = not_null / total_cols * 100
-    status = STATUS_OPEN if not_null == 0 else (STATUS_COMPLETED if pct >= 20 else STATUS_IN_PROGRESS)
-    return Result(
-        "R-02-03", "", "", "", status,
-        f"Schemas are actively managed: {not_null:,} of {total_cols:,} column(s) "
-        f"({pct:.1f}%) declare NOT NULL in {scope.label}, and {alters:,} schema-altering "
-        f"operation(s) were audited in the last {ctx.lookback_days} days. Delta enforces "
-        "schema on write by default.",
-        {"not_null_columns": not_null, "total_columns": total_cols,
-         "alter_events": alters, "scoped": True},
+    return manual_result(
+        "R-02-03",
+        "Delta enforces schema on write automatically, so active schema management is a "
+        "process (how schema changes are reviewed and evolution is governed) that cannot "
+        f"be confirmed from system tables. For context, {alters:,} schema-altering "
+        f"operation(s) were audited in the last {ctx.lookback_days} days.",
+        "the schema-change review process, how breaking changes are gated, and the "
+        "schema-evolution policy for your tables.",
     )
 
 

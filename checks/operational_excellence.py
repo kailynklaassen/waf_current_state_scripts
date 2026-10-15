@@ -562,19 +562,14 @@ def oe_02_02(ctx: Ctx) -> Result:
     total = int(row.get("total") or 0)
     governed = int(row.get("policy_backed") or 0)
     if total == 0:
-        return presence_result(
-            "OE-02-02",
-            policies,
-            "cluster policy/policies defining standard compute configurations",
-            found_note=(
-                f"No classic clusters were active in the last {ctx.lookback_days} days, "
-                "so policy enforcement could not be measured directly."
-            ),
-            missing_note=(
-                "No cluster policies and no active clusters; compute standards cannot be "
-                "confirmed."
-            ),
-            metrics={"policies": policies},
+        # Policies existing is not the same as compute being standardized in practice:
+        # with no clusters created from them, standardization is unconfirmed, not done.
+        return Result(
+            "OE-02-02", "", "", "", STATUS_OPEN,
+            f"{policies or 0} cluster policy/policies are defined, but no classic clusters "
+            f"were created in the last {ctx.lookback_days} days, so standardized compute "
+            "configuration is not confirmed in use.",
+            {"policies": policies, "clusters": 0},
         )
     return ratio_result(
         "OE-02-02",
@@ -1435,8 +1430,8 @@ def oe_04_02(ctx: Ctx) -> Result:
             SELECT count(*) AS n FROM system.query.history
             WHERE start_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
               AND lower(statement_text) LIKE '%system.billing.usage%'
-              AND (lower(statement_text) RLIKE '(forecast|trend|projection|budget)'
-                   OR lower(statement_text) LIKE '%group by%')
+              AND lower(statement_text) RLIKE
+                  '(forecast|trend|projection|budget|capacity|cumulative|rolling|over \\(|window)'
             """
         )
     if days == 0:
