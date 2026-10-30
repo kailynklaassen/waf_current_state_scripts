@@ -18,6 +18,8 @@ from waf_core import (
     ratio_result,
 )
 
+from checks import inventory
+
 PILLAR_ID = "operational-excellence"
 
 
@@ -63,12 +65,8 @@ def _jobs_managed_as_code(ctx: Ctx) -> dict[str, int | bool]:
     Asset-Bundle signal alone (``audit`` False in the result) so the check still runs.
     """
     row = ctx.one(
-        """
-        WITH latest AS (
-          SELECT job_id, deployment,
-                 row_number() OVER (PARTITION BY job_id ORDER BY change_time DESC) AS rn
-          FROM system.lakeflow.jobs WHERE delete_time IS NULL
-        )
+        f"""
+        WITH {inventory.live_latest_cte("jobs", "job_id, deployment")}
         SELECT count(*) AS total,
                count_if(deployment.kind IS NOT NULL) AS dabs
         FROM latest WHERE rn = 1
@@ -83,14 +81,10 @@ def _jobs_managed_as_code(ctx: Ctx) -> dict[str, int | bool]:
 
     row = ctx.one(
         f"""
-        WITH latest AS (
-          SELECT job_id, deployment,
-                 row_number() OVER (PARTITION BY job_id ORDER BY change_time DESC) AS rn
-          FROM system.lakeflow.jobs WHERE delete_time IS NULL
-        ),
-        jobs AS (SELECT CAST(job_id AS STRING) AS job_id, deployment FROM latest WHERE rn = 1),
+        WITH {inventory.live_latest_cte("jobs", "job_id, deployment")},
+        jobs AS (SELECT workspace_id, CAST(job_id AS STRING) AS job_id, deployment FROM latest),
         mgmt AS (
-          SELECT CAST(element_at(request_params, 'job_id') AS STRING) AS job_id,
+          SELECT workspace_id, CAST(element_at(request_params, 'job_id') AS STRING) AS job_id,
                  max(CASE WHEN lower(coalesce(user_agent, '')) RLIKE '{_TERRAFORM_UA}'
                           THEN 1 ELSE 0 END) AS tf,
                  max(CASE WHEN lower(coalesce(user_agent, '')) RLIKE '{_API_UA}'
@@ -99,14 +93,14 @@ def _jobs_managed_as_code(ctx: Ctx) -> dict[str, int | bool]:
           WHERE event_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
             AND service_name = 'jobs' AND action_name IN ('create', 'update', 'reset')
             AND element_at(request_params, 'job_id') IS NOT NULL
-          GROUP BY 1
+          GROUP BY 1, 2
         )
         SELECT count(*) AS total,
                count_if(j.deployment.kind IS NOT NULL OR m.tf = 1 OR m.api = 1) AS managed,
                count_if(j.deployment.kind IS NOT NULL) AS dabs,
                count_if(coalesce(m.tf, 0) = 1) AS terraform,
                count_if(coalesce(m.api, 0) = 1) AS api
-        FROM jobs j LEFT JOIN mgmt m ON j.job_id = m.job_id
+        FROM jobs j LEFT JOIN mgmt m ON j.workspace_id = m.workspace_id AND j.job_id = m.job_id
         """
     )
     return {
@@ -136,19 +130,16 @@ def oe_01_01(ctx: Ctx) -> Result:
 
 def oe_01_02(ctx: Ctx) -> Result:
     """Use enterprise source code management (SCM)."""
-    repos = _sdk_count(ctx, "repos")
-    git_creds = _sdk_count(ctx, "git_credentials")
+    folders = inventory.lifecycle_evidence(ctx, "git_folders")
+    creds = inventory.lifecycle_evidence(ctx, "git_credentials")
+    repos, git_creds = folders["registered"], creds["registered"]
     # Git-backed job deployments are the strongest signal that SCM is really in the loop.
     git_jobs = 0
     total_jobs = 0
     if ctx.has_table("system.lakeflow.jobs"):
         row = ctx.one(
-            """
-            WITH latest AS (
-              SELECT job_id, deployment,
-                     row_number() OVER (PARTITION BY job_id ORDER BY change_time DESC) AS rn
-              FROM system.lakeflow.jobs WHERE delete_time IS NULL
-            )
+            f"""
+            WITH {inventory.live_latest_cte("jobs", "job_id, deployment")}
             SELECT count(*) AS total,
                    count_if(deployment IS NOT NULL AND deployment.kind IS NOT NULL) AS git_backed
             FROM latest WHERE rn = 1
@@ -174,19 +165,14 @@ def oe_01_02(ctx: Ctx) -> Result:
             "active jobs are deployed from a Git source or bundle rather than "
             "hand-edited in the workspace",
             complete_at=ctx.complete_at,
-            extra=(
-                f"{repos if repos is not None else 'unknown'} Git folder(s) and "
-                f"{git_creds if git_creds is not None else 'unknown'} Git credential(s) "
-                "configured."
-            ),
+            extra=f"{folders['text']}; {creds['text']}.",
             metrics={"repos": repos, "git_credentials": git_creds,
                      "git_backed_jobs": git_jobs},
         )
     return Result(
         "OE-01-02", "", "", "", STATUS_IN_PROGRESS,
-        f"Source control is partially in evidence: {repos} Git folder(s) and "
-        f"{git_creds} Git credential(s) exist, but no jobs were found to confirm "
-        "deployments originate from Git.",
+        f"Source control is partially in evidence: {folders['text']}; {creds['text']}. "
+        "No jobs were found to confirm deployments originate from Git.",
         {"repos": repos, "git_credentials": git_creds},
     )
 
@@ -235,7 +221,7 @@ def oe_01_03(ctx: Ctx) -> Result:
 
 def oe_01_04(ctx: Ctx) -> Result:
     """Standardize MLOps processes across enterprise."""
-    uc_models = _sdk_count(ctx, "registered_models")
+    uc_models = inventory.scoped_model_count(ctx)
     experiments = 0
     runs = 0
     if ctx.has_table("system.mlflow.experiments_latest"):
@@ -262,17 +248,19 @@ def oe_01_04(ctx: Ctx) -> Result:
     if models == 0:
         return Result(
             "OE-01-04", "", "", "", STATUS_OPEN,
-            f"No models registered in Unity Catalog, so MLOps standardization on the "
-            f"registry is not in evidence. While {experiments} experiment(s) and "
+            f"No models registered in Unity Catalog in {ctx.scope.label}, so MLOps "
+            f"standardization on the registry is not in evidence. While {experiments} "
+            f"experiment(s) and "
             f"{runs:,} run(s) exist in the last {ctx.lookback_days} days, model promotion "
             "between environments requires registered models. Mark ignore in the WAF tool if ML is out of scope.",
             {"uc_models": 0, "experiments": experiments, "runs": runs},
         )
     return Result(
         "OE-01-04", "", "", "", STATUS_COMPLETED,
-        f"MLOps is standardized on Unity Catalog: {models} registered model(s), "
-        f"{experiments} experiment(s), and {runs:,} tracked run(s) in the last "
-        f"{ctx.lookback_days} days.",
+        f"MLOps is standardized on Unity Catalog: {models} registered model(s) in "
+        f"{ctx.scope.label}, plus {experiments} MLflow experiment(s) and {runs:,} tracked "
+        f"run(s) in this region in the last {ctx.lookback_days} days (experiments are not "
+        "catalog objects, so they are not limited to the production catalogs).",
         {"uc_models": models, "experiments": experiments, "runs": runs},
     )
 
@@ -320,7 +308,7 @@ def oe_01_06(ctx: Ctx) -> Result:
         gateway = ctx.count_safe(
             f"""
             SELECT count(*) AS n FROM system.ai_gateway.usage
-            WHERE request_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
+            WHERE event_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
             """
         )
     if endpoints == 0:
@@ -382,8 +370,9 @@ def oe_01_07(ctx: Ctx) -> Result:
         "OE-01-07",
         documented,
         total,
-        "non-system catalogs carry a description, indicating a deliberate catalog "
-        "strategy rather than ad-hoc creation",
+        "non-system catalogs in this metastore carry a description, indicating a "
+        "deliberate catalog strategy rather than ad-hoc creation (all catalogs, not only "
+        "the production scope: catalog strategy is a metastore-wide decision)",
         complete_at=ctx.complete_at,
         none_found=(
             "No non-system catalogs found, so no Unity Catalog strategy is in evidence."
@@ -538,7 +527,7 @@ def oe_02_01(ctx: Ctx) -> Result:
 
 def oe_02_02(ctx: Ctx) -> Result:
     """Standardize compute configurations."""
-    policies = _sdk_count(ctx, "cluster_policies")
+    pol = inventory.policy_evidence(ctx)
     if not ctx.has_table("system.compute.clusters"):
         return Result(
             "OE-02-02", "", "", "", STATUS_OPEN,
@@ -547,13 +536,7 @@ def oe_02_02(ctx: Ctx) -> Result:
         )
     row = ctx.one(
         f"""
-        WITH latest AS (
-          SELECT cluster_id, policy_id,
-                 row_number() OVER (PARTITION BY cluster_id ORDER BY change_time DESC) AS rn
-          FROM system.compute.clusters
-          WHERE delete_time IS NULL
-            AND change_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-        )
+        {inventory.workloads_cte(ctx, 'cluster_id, policy_id')}
         SELECT count(*) AS total,
                count_if(policy_id IS NOT NULL AND policy_id <> '') AS policy_backed
         FROM latest WHERE rn = 1
@@ -566,24 +549,20 @@ def oe_02_02(ctx: Ctx) -> Result:
         # with no clusters created from them, standardization is unconfirmed, not done.
         return Result(
             "OE-02-02", "", "", "", STATUS_OPEN,
-            f"{policies or 0} cluster policy/policies are defined, but no classic clusters "
-            f"were created in the last {ctx.lookback_days} days, so standardized compute "
-            "configuration is not confirmed in use.",
-            {"policies": policies, "clusters": 0},
+            f"Cluster policies: {pol['text']}. But no classic clusters were created in "
+            f"the last {ctx.lookback_days} days, so standardized compute configuration "
+            "is not confirmed in use.",
+            {**pol["metrics"], "clusters": 0},
         )
     return ratio_result(
         "OE-02-02",
         governed,
         total,
-        "active clusters were created from a cluster policy, so compute configuration is "
+        f"{inventory.workload_unit(ctx)} run under a cluster policy, so compute configuration is "
         "standardized rather than per-user",
         complete_at=ctx.complete_at,
-        extra=(
-            f"{policies} policy/policies defined."
-            if policies is not None
-            else "Policy inventory unavailable via the SDK."
-        ),
-        metrics={"policies": policies, "governed_clusters": governed},
+        extra=f"Cluster policies: {pol['text']}.",
+        metrics={**pol["metrics"], "governed_clusters": governed},
     )
 
 
@@ -595,12 +574,8 @@ def oe_02_03(ctx: Ctx) -> Result:
             "system.lakeflow.jobs is not readable, so job scheduling cannot be assessed.",
         )
     row = ctx.one(
-        """
-        WITH latest AS (
-          SELECT job_id, trigger, trigger_type, paused,
-                 row_number() OVER (PARTITION BY job_id ORDER BY change_time DESC) AS rn
-          FROM system.lakeflow.jobs WHERE delete_time IS NULL
-        )
+        f"""
+        WITH {inventory.live_latest_cte("jobs", "job_id, trigger, trigger_type, paused")}
         SELECT count(*) AS total,
                count_if(trigger IS NOT NULL
                         AND (trigger.schedule IS NOT NULL
@@ -637,12 +612,8 @@ def oe_02_04(ctx: Ctx) -> Result:
     file_arrival = 0
     if ctx.has_table("system.lakeflow.jobs"):
         file_arrival = ctx.count_safe(
-            """
-            WITH latest AS (
-              SELECT job_id, trigger,
-                     row_number() OVER (PARTITION BY job_id ORDER BY change_time DESC) AS rn
-              FROM system.lakeflow.jobs WHERE delete_time IS NULL
-            )
+            f"""
+            WITH {inventory.live_latest_cte("jobs", "job_id, trigger")}
             SELECT count(*) AS n FROM latest
             WHERE rn = 1 AND trigger.file_arrival IS NOT NULL
             """
@@ -669,11 +640,9 @@ def oe_02_04(ctx: Ctx) -> Result:
     connectors = 0
     if ctx.has_table("system.lakeflow.pipelines"):
         connectors = ctx.count_safe(
-            """
-            SELECT count(*) AS n FROM system.lakeflow.pipelines
-            WHERE delete_time IS NULL
-              AND lower(coalesce(pipeline_type, '')) RLIKE '(ingestion|managed)'
-            """
+            inventory.live_count_sql(
+                "pipelines", "pipeline_type",
+                "lower(coalesce(pipeline_type, '')) RLIKE '(ingestion|managed)'")
         )
     signals = []
     if file_arrival:
@@ -712,13 +681,12 @@ def oe_02_05(ctx: Ctx) -> Result:
     pipelines = 0
     if ctx.has_table("system.lakeflow.pipelines"):
         pipelines = ctx.count_safe(
-            "SELECT count(*) AS n FROM system.lakeflow.pipelines WHERE delete_time IS NULL"
+            inventory.live_count_sql("pipelines")
         )
     jobs = 0
     if ctx.has_table("system.lakeflow.jobs"):
         jobs = ctx.count_safe(
-            "SELECT count(DISTINCT job_id) AS n FROM system.lakeflow.jobs "
-            "WHERE delete_time IS NULL"
+            inventory.live_count_sql("jobs")
         )
     total = pipelines + jobs
     if total == 0:
@@ -744,23 +712,20 @@ def oe_02_05(ctx: Ctx) -> Result:
 
 def oe_02_06(ctx: Ctx) -> Result:
     """Follow the deploy-code approach for ML workloads."""
-    uc_models = _sdk_count(ctx, "registered_models")
+    uc_models = inventory.scoped_model_count(ctx)
     if not uc_models:
         return Result(
             "OE-02-06", "", "", "", STATUS_OPEN,
-            "No models registered in Unity Catalog, so the deploy-code pattern cannot be "
-            "confirmed. Mark ignore in the WAF tool if ML is out of scope.",
+            f"No models registered in Unity Catalog in {ctx.scope.label}, so the "
+            "deploy-code pattern cannot be confirmed. Mark ignore in the WAF tool if ML is "
+            "out of scope.",
             {"uc_models": uc_models},
         )
     ml_jobs = 0
     if ctx.has_table("system.lakeflow.jobs"):
         ml_jobs = ctx.count_safe(
             f"""
-            WITH latest AS (
-              SELECT job_id, name, deployment,
-                     row_number() OVER (PARTITION BY job_id ORDER BY change_time DESC) AS rn
-              FROM system.lakeflow.jobs WHERE delete_time IS NULL
-            )
+            WITH {inventory.live_latest_cte("jobs", "job_id, name, deployment")}
             SELECT count(*) AS n FROM latest
             WHERE rn = 1
               AND lower(coalesce(name, '')) RLIKE '(train|model|ml|feature|score|predict|inference)'
@@ -769,7 +734,8 @@ def oe_02_06(ctx: Ctx) -> Result:
     if ml_jobs == 0:
         return Result(
             "OE-02-06", "", "", "", STATUS_OPEN,
-            f"{uc_models} model(s) are registered in Unity Catalog but no ML-named "
+            f"{uc_models} model(s) are registered in Unity Catalog in "
+            f"{ctx.scope.label} but no ML-named "
             "training or scoring jobs were found, so the deploy-code pattern is not "
             "in evidence. Retraining and scoring may be manual or interactive.",
             {"uc_models": uc_models, "ml_jobs": 0},
@@ -777,15 +743,16 @@ def oe_02_06(ctx: Ctx) -> Result:
     return Result(
         "OE-02-06", "", "", "", STATUS_COMPLETED,
         f"Deploy-code is in evidence: {ml_jobs} automated ML job(s) (training/scoring) "
-        f"alongside {uc_models} UC-registered model(s), so code is promoted and models "
-        "are produced per environment.",
+        f"in this region alongside {uc_models} UC-registered model(s) in "
+        f"{ctx.scope.label}, so code is promoted and models are produced per "
+        "environment.",
         {"uc_models": uc_models, "ml_jobs": ml_jobs},
     )
 
 
 def oe_02_07(ctx: Ctx) -> Result:
     """Use a model registry to decouple code and model lifecycle."""
-    uc_models = _sdk_count(ctx, "registered_models")
+    uc_models = inventory.scoped_model_count(ctx)
     if uc_models is None:
         return Result(
             "OE-02-07", "", "", "", STATUS_OPEN,
@@ -795,23 +762,26 @@ def oe_02_07(ctx: Ctx) -> Result:
     if uc_models == 0:
         return Result(
             "OE-02-07", "", "", "", STATUS_OPEN,
-            "No models registered in Unity Catalog, so there is no registry decoupling "
-            "code from model versions. Mark ignore in the WAF tool if ML is out of scope.",
+            f"No models registered in Unity Catalog in {ctx.scope.label}, so there is no "
+            "registry decoupling code from model versions. Mark ignore in the WAF tool if "
+            "ML is out of scope.",
             {"uc_models": 0},
         )
     served = 0
     if ctx.has_table("system.serving.served_entities"):
         served = ctx.count_safe(
-            """
+            f"""
             SELECT count(DISTINCT entity_name) AS n FROM system.serving.served_entities
             WHERE endpoint_delete_time IS NULL AND entity_type = 'CUSTOM_MODEL'
+              AND {ctx.scope.predicate("substring_index(entity_name, '.', 1)",
+                                       "substring_index(substring_index(entity_name, '.', 2), '.', -1)")}
             """
         )
     return Result(
         "OE-02-07", "", "", "", STATUS_COMPLETED,
-        f"{uc_models} model(s) are registered in Unity Catalog, giving versioned model "
-        f"artifacts independent of code releases; {served} distinct model(s) are served "
-        "from the registry.",
+        f"{uc_models} model(s) are registered in Unity Catalog in {ctx.scope.label}, "
+        f"giving versioned model artifacts independent of code releases; {served} "
+        "distinct model(s) from those catalogs are served from the registry.",
         {"uc_models": uc_models, "served_models": served},
     )
 
@@ -867,20 +837,15 @@ def oe_02_09(ctx: Ctx) -> Result:
             "assessed.",
         )
     ml_jobs = ctx.count_safe(
-        """
-        WITH latest AS (
-          SELECT job_id, name,
-                 row_number() OVER (PARTITION BY job_id ORDER BY change_time DESC) AS rn
-          FROM system.lakeflow.jobs WHERE delete_time IS NULL
-        )
+        f"""
+        WITH {inventory.live_latest_cte("jobs", "job_id, name")}
         SELECT count(*) AS n FROM latest
         WHERE rn = 1
           AND lower(coalesce(name, '')) RLIKE '(train|model|ml|feature|score|predict|inference)'
         """
     )
     total_jobs = ctx.count_safe(
-        "SELECT count(DISTINCT job_id) AS n FROM system.lakeflow.jobs "
-        "WHERE delete_time IS NULL"
+        inventory.live_count_sql("jobs")
     )
     runs = 0
     if ctx.has_table("system.mlflow.runs_latest"):
@@ -922,12 +887,8 @@ def oe_02_10(ctx: Ctx) -> Result:
     serverless_pipelines = 0
     if ctx.has_table("system.lakeflow.pipelines"):
         row = ctx.one(
-            """
-            WITH latest AS (
-              SELECT pipeline_id, settings,
-                     row_number() OVER (PARTITION BY pipeline_id ORDER BY change_time DESC) AS rn
-              FROM system.lakeflow.pipelines WHERE delete_time IS NULL
-            )
+            f"""
+            WITH {inventory.live_latest_cte("pipelines", "pipeline_id, settings")}
             SELECT count(*) AS total,
                    count_if(settings.serverless = true) AS serverless
             FROM latest WHERE rn = 1
@@ -939,16 +900,15 @@ def oe_02_10(ctx: Ctx) -> Result:
     total_jobs = 0
     if ctx.has_table("system.lakeflow.job_tasks"):
         multi_task = ctx.count_safe(
-            """
-            SELECT count(DISTINCT job_id) AS n FROM system.lakeflow.job_tasks
-            WHERE delete_time IS NULL
-              AND depends_on_keys IS NOT NULL AND size(depends_on_keys) > 0
+            f"""
+            WITH {inventory.live_latest_cte("job_tasks", "depends_on_keys")}
+            SELECT count(DISTINCT workspace_id, job_id) AS n FROM latest
+            WHERE depends_on_keys IS NOT NULL AND size(depends_on_keys) > 0
             """
         )
     if ctx.has_table("system.lakeflow.jobs"):
         total_jobs = ctx.count_safe(
-            "SELECT count(DISTINCT job_id) AS n FROM system.lakeflow.jobs "
-            "WHERE delete_time IS NULL"
+            inventory.live_count_sql("jobs")
         )
     declarative = pipelines + multi_task
     total = pipelines + total_jobs
@@ -1170,15 +1130,11 @@ def oe_03_04(ctx: Ctx) -> Result:
     event_triggers = 0
     if ctx.has_table("system.lakeflow.jobs"):
         row = ctx.one(
-            """
-            WITH latest AS (
-              SELECT job_id, health_rules, trigger,
-                     row_number() OVER (PARTITION BY job_id ORDER BY change_time DESC) AS rn
-              FROM system.lakeflow.jobs WHERE delete_time IS NULL
-            )
+            f"""
+            WITH {inventory.live_latest_cte("jobs", "job_id, health_rules, trigger")}
             SELECT count(*) AS total,
                    count_if(health_rules IS NOT NULL
-                            AND lower(to_json(health_rules)) NOT IN ('null', '[]', '{}')) AS with_rules,
+                            AND lower(to_json(health_rules)) NOT IN ('null', '[]', '{{}}')) AS with_rules,
                    count_if(trigger.file_arrival IS NOT NULL
                             OR trigger.table_update IS NOT NULL) AS event_driven
             FROM latest WHERE rn = 1
@@ -1220,16 +1176,14 @@ def oe_03_04(ctx: Ctx) -> Result:
 #:   sql_max     - the fullest group (``query`` returns the max per catalog/schema)
 #:   sdk_count   - length of an SDK list (``sdk`` = WorkspaceClient attribute)
 DEFAULT_QUOTA_LIMITS: dict[str, dict] = {
+    # Per-workspace limits: counted for EVERY workspace from system tables / the audit
+    # log (checks.inventory), and the fullest workspace is compared with the limit.
     "saved_jobs": {
-        "label": "Saved jobs (per workspace)", "limit": 12_000, "kind": "sql_count",
-        "requires": "system.lakeflow.jobs",
-        "query": "SELECT count(DISTINCT job_id) AS n FROM system.lakeflow.jobs "
-                 "WHERE delete_time IS NULL"},
+        "label": "Saved jobs (per workspace)", "limit": 12_000, "kind": "ws_inventory",
+        "source": "saved_jobs"},
     "saved_pipelines": {
         "label": "Saved Lakeflow pipelines (per workspace)", "limit": 12_000,
-        "kind": "sql_count", "requires": "system.lakeflow.pipelines",
-        "query": "SELECT count(*) AS n FROM system.lakeflow.pipelines "
-                 "WHERE delete_time IS NULL"},
+        "kind": "ws_inventory", "source": "saved_pipelines"},
     "catalogs": {
         "label": "Catalogs (per metastore)", "limit": 1_000, "kind": "sql_count",
         "requires": "system.information_schema.catalogs",
@@ -1262,13 +1216,20 @@ DEFAULT_QUOTA_LIMITS: dict[str, dict] = {
                  "FROM system.information_schema.volumes GROUP BY volume_catalog, volume_schema)"},
     "sql_warehouses": {
         "label": "SQL warehouses (per workspace)", "limit": 1_000,
-        "kind": "sdk_count", "sdk": "warehouses"},
+        "kind": "ws_inventory", "source": "sql_warehouses"},
     "apps": {
         "label": "Databricks Apps (per workspace)", "limit": 100,
-        "kind": "sdk_count", "sdk": "apps"},
+        "kind": "ws_inventory", "source": "apps"},
     "secret_scopes": {
         "label": "Secret scopes (per workspace)", "limit": 1_000,
-        "kind": "sdk_count", "sdk": "secrets", "sdk_sub": "list_scopes"},
+        "kind": "ws_inventory", "source": "secret_scopes"},
+    # Account-level identity limits, read through the workspace account-SCIM endpoint.
+    "users_and_service_principals": {
+        "label": "Users + service principals (per account)", "limit": 10_000,
+        "kind": "identity", "source": ("Users", "ServicePrincipals")},
+    "groups": {
+        "label": "Groups (per account)", "limit": 5_000,
+        "kind": "identity", "source": ("Groups",)},
     "uc_registered_models": {
         "label": "UC registered models (per metastore)", "limit": 5_000,
         "kind": "sdk_count", "sdk": "registered_models"},
@@ -1278,10 +1239,47 @@ DEFAULT_QUOTA_LIMITS: dict[str, dict] = {
 #: the rationale as items to confirm manually rather than silently dropped.
 _QUOTA_MANUAL_NOTES = (
     "concurrent task runs (2,000/workspace) and parent task runs (750/workspace) are "
-    "runtime-concurrency limits - inspect peak concurrency in run history; and "
-    "account-level quotas (users/SPs 10,000, groups 5,000, workspaces per tier) are not "
-    "workspace-scoped. Confirm any account-level limit increases in the account console."
+    "runtime-concurrency limits - inspect peak concurrency in run history; and the "
+    "workspaces-per-account limit depends on the pricing tier. Confirm any limit "
+    "increases with your account team and record them in QUOTA_LIMIT_OVERRIDES."
 )
+
+
+def _ws_inventory_counts(ctx: Ctx, source: str) -> dict[int, int] | None:
+    """``{workspace_id: count}`` for a per-workspace quota asset, across all workspaces."""
+    if source in ("saved_jobs", "saved_pipelines", "sql_warehouses"):
+        return inventory.simple_counts(ctx).get(source)
+    if source == "apps":
+        per = inventory.app_inventory(ctx)
+    else:
+        per = inventory.lifecycle(ctx, source)
+    return None if per is None else {ws: r["registered"] for ws, r in per.items()}
+
+
+#: Efficiency signals reported alongside OE-04-01: (label, kind). "Active" means used
+#: within lookback_days; deleted objects are excluded (see checks.inventory).
+_EFFICIENCY_KINDS = [
+    ("secret scopes read", "secret_scopes"),
+    ("Git folders synced", "git_folders"),
+    ("Databricks Apps billed", "apps"),
+    ("custom cluster policies used by an active cluster", "cluster_policies"),
+]
+
+
+def _efficiency(ctx: Ctx) -> list[tuple[str, int, int]]:
+    """``[(label, active, registered)]`` across all workspaces."""
+    out = []
+    for label, kind in _EFFICIENCY_KINDS:
+        if kind == "apps":
+            t = inventory.totals(inventory.app_inventory(ctx))
+        elif kind == "cluster_policies":
+            pu = inventory.policy_usage(ctx)
+            t = inventory.totals(pu["custom"] if pu else None)
+        else:
+            t = inventory.totals(inventory.lifecycle(ctx, kind))
+        if t["registered"]:
+            out.append((label, t["active"], t["registered"]))
+    return out
 
 
 def oe_04_01(ctx: Ctx) -> Result:
@@ -1292,14 +1290,15 @@ def oe_04_01(ctx: Ctx) -> Result:
     utilization %. Scoring is *inverse* - more consumed capacity is worse, because
     approaching a limit is what needs action:
 
-        any single asset >= 80% of its limit  -> open         (capacity action needed)
-        else average >= 60%                    -> in-progress  (monitor, plan increases)
-        else                                   -> completed    (ample headroom)
+        fullest asset >= 80% of its limit  -> open         (capacity action needed)
+        fullest asset 60-79%               -> in-progress  (monitor, plan increases)
+        fullest asset < 60%                -> completed    (ample headroom)
 
-    The average is the headline, but one asset near its ceiling forces ``open`` on its
-    own - it can't be averaged away by many idle resources. Every assessed asset's % is
-    listed in the rationale (highest first) so it is clear what drives the status; limits
-    that cannot be counted are called out for manual confirmation. Limits are config-
+    Scored on the FULLEST limit, not the average: a limit near its ceiling needs action
+    however idle the others are (an average of 13.5% once hid two limits at ~70%). Every
+    other assessed asset's % is still listed in the rationale (highest first) with the
+    average as context; limits that cannot be counted are called out for manual
+    confirmation. Limits are config-
     overridable (``cfg["quota_limit_overrides"]``) because many are raisable defaults.
     """
     limits = dict(ctx.cfg.get("quota_limits") or DEFAULT_QUOTA_LIMITS)
@@ -1313,6 +1312,8 @@ def oe_04_01(ctx: Ctx) -> Result:
 
     assessed: list[tuple[str, int, int, float]] = []  # (label, count, limit, frac)
     unavailable: list[str] = []
+    # spec label -> (limit, [(workspace_id, count), ...] fullest first) for EVERY workspace
+    per_ws_detail: dict[str, tuple[int, list[tuple[int, int]]]] = {}
     for spec in limits.values():
         label = spec["label"]
         limit = spec.get("limit") or 0
@@ -1325,6 +1326,20 @@ def oe_04_01(ctx: Ctx) -> Result:
                 count = None
         elif kind == "sdk_count":
             count = _sdk_count(ctx, spec["sdk"], spec.get("sdk_sub", "list"))
+        elif kind == "ws_inventory":
+            per_ws = _ws_inventory_counts(ctx, spec["source"])
+            if per_ws:
+                worst_ws, count = max(per_ws.items(), key=lambda kv: kv[1])
+                label = (f"{label} - fullest of {len(per_ws):,} workspace(s): "
+                         f"{inventory.ws_label(ctx, worst_ws)}")
+                per_ws_detail[spec["label"]] = (int(limit), sorted(
+                    per_ws.items(), key=lambda kv: kv[1], reverse=True))
+            elif per_ws is not None:
+                count = 0
+        elif kind == "identity":
+            ids = inventory.identity_counts(ctx)
+            if ids is not None:
+                count = sum(ids.get(k, 0) for k in spec["source"])
         if count is None or limit <= 0:
             unavailable.append(label)
             continue
@@ -1341,45 +1356,67 @@ def oe_04_01(ctx: Ctx) -> Result:
 
     avg = sum(f for *_, f in assessed) / len(assessed)
     ranked = sorted(assessed, key=lambda t: t[3], reverse=True)
+    top_label, top_count, top_limit, top = ranked[0]
     over_limit = [row for row in ranked if row[3] >= open_at]
+    watch = [row for row in ranked if complete_below <= row[3] < open_at]
+    fmt = lambda rows: "; ".join(f"{label} {frac * 100:.1f}% ({count:,}/{limit:,})"
+                                 for label, count, limit, frac in rows)
 
-    if over_limit:
+    if top >= open_at:
         status = STATUS_OPEN
-        verdict = (
-            f"{len(over_limit)} asset(s) at or above {open_at * 100:.0f}% of their "
-            "limit - capacity action needed"
-        )
-    elif avg >= complete_below:
+        verdict = (f"{len(over_limit)} limit(s) at or above {open_at * 100:.0f}% - "
+                   "capacity action needed")
+    elif top >= complete_below:
         status = STATUS_IN_PROGRESS
-        verdict = (
-            f"average utilization {avg * 100:.1f}% is in the {complete_below * 100:.0f}-"
-            f"{open_at * 100:.0f}% monitor band - plan limit increases"
-        )
+        verdict = (f"{len(watch)} limit(s) in the {complete_below * 100:.0f}-"
+                   f"{open_at * 100:.0f}% watch band - monitor and plan limit increases")
     else:
         status = STATUS_COMPLETED
-        verdict = (
-            f"average utilization {avg * 100:.1f}% is below {complete_below * 100:.0f}% "
-            f"and no asset is at/above the {open_at * 100:.0f}% action threshold - "
-            "ample headroom"
-        )
+        verdict = f"every limit is below {complete_below * 100:.0f}% - ample headroom"
 
-    per_asset = "; ".join(
-        f"{label} {count:,}/{limit:,} ({frac * 100:.1f}%)"
-        for label, count, limit, frac in ranked
-    )
     reason = (
-        f"Service-limit utilization across {len(assessed)} documented limit(s) "
-        f"(average {avg * 100:.1f}%) - {verdict}. "
+        f"Fullest service limit: {top_label} at {top * 100:.1f}% ({top_count:,}/"
+        f"{top_limit:,}) - {verdict}. Status follows the fullest limit (>= "
+        f"{open_at * 100:.0f}% open, {complete_below * 100:.0f}-{open_at * 100:.0f}% "
+        f"in-progress, below {complete_below * 100:.0f}% completed). "
     )
     if over_limit:
-        drivers = "; ".join(
-            f"{label} {frac * 100:.1f}% ({count:,}/{limit:,})"
-            for label, count, limit, frac in over_limit
-        )
-        reason += f"Driving the status (>= {open_at * 100:.0f}% of limit): {drivers}. "
-    reason += f"All assessed assets, highest first: {per_asset}."
+        reason += f"At/above {open_at * 100:.0f}%: {fmt(over_limit)}. "
+    if watch:
+        reason += (f"In the {complete_below * 100:.0f}-{open_at * 100:.0f}% watch band: "
+                   f"{fmt(watch)}. ")
+    reason += (f"All {len(assessed)} assessed limits, highest first: {fmt(ranked)}. "
+               f"Average utilization {avg * 100:.1f}% (context only; does not set the "
+               "status).")
+    if per_ws_detail:
+        bands = []
+        for label, (lim, items) in per_ws_detail.items():
+            hi = sum(1 for _, n in items if n / lim >= open_at)
+            mid = sum(1 for _, n in items if complete_below <= n / lim < open_at)
+            bands.append(f"{label}: {len(items):,} workspace(s) - {hi} at/above "
+                         f"{open_at * 100:.0f}%, {mid} at {complete_below * 100:.0f}-"
+                         f"{open_at * 100:.0f}%, {len(items) - hi - mid:,} below "
+                         f"{complete_below * 100:.0f}%")
+        reason += (" Per-workspace limits across every workspace (status uses the "
+                   "fullest; full per-workspace table in the report appendix): "
+                   + "; ".join(bands) + ".")
     if unavailable:
         reason += " Not auto-counted (confirm manually): " + ", ".join(unavailable) + "."
+    active_ids = inventory.active_identities(ctx)
+    if active_ids is not None and inventory.identity_counts(ctx):
+        ids = inventory.identity_counts(ctx)
+        reg = ids.get("Users", 0) + ids.get("ServicePrincipals", 0)
+        reason += (f" Identities: {reg:,} users + service principals registered, "
+                   f"{active_ids:,} active in the last {ctx.lookback_days} days.")
+    eff = _efficiency(ctx)
+    if eff:
+        reason += (" Efficiency (does not change the status; active vs registered across "
+                   "all workspaces): " + "; ".join(
+                       f"{label} {a:,}/{r:,} ({100 * a / r:.0f}%)" for label, a, r in eff)
+                   + ".")
+        note = inventory.coverage_note(ctx, "secret_scopes")
+        if note:
+            reason += " " + note
     reason += " Also " + _QUOTA_MANUAL_NOTES
 
     return Result(
@@ -1388,11 +1425,20 @@ def oe_04_01(ctx: Ctx) -> Result:
             "avg_utilization_pct": round(avg * 100, 2),
             "max_utilization_pct": round(ranked[0][3] * 100, 2),
             "over_limit_assets": [label for label, *_ in over_limit],
+            "watch_band_assets": [label for label, *_ in watch],
+            "fullest_asset": top_label,
             "assessed_count": len(assessed),
             "assets": {label: {"count": count, "limit": limit,
                                "utilization_pct": round(frac * 100, 2)}
                        for label, count, limit, frac in assessed},
             "uncounted": unavailable,
+            "per_workspace": {
+                k: {"limit": lim,
+                    "workspaces": [[inventory.ws_label(ctx, ws), n,
+                                    round(100 * n / lim, 2)] for ws, n in items]}
+                for k, (lim, items) in per_ws_detail.items()},
+            "efficiency": {label: {"active": a, "registered": r}
+                           for label, a, r in _efficiency(ctx)},
             "complete_below_pct": round(complete_below * 100, 2),
             "open_at_pct": round(open_at * 100, 2),
         },
@@ -1411,13 +1457,13 @@ def oe_04_02(ctx: Ctx) -> Result:
         f"""
         SELECT
           count(DISTINCT usage_date) AS days,
-          sum(CASE WHEN usage_date >= current_date() - INTERVAL 30 DAYS
+          sum(CASE WHEN usage_date > current_date() - INTERVAL 30 DAYS
                    THEN usage_quantity ELSE 0 END) AS recent,
-          sum(CASE WHEN usage_date < current_date() - INTERVAL 30 DAYS
-                        AND usage_date >= current_date() - INTERVAL 60 DAYS
+          sum(CASE WHEN usage_date <= current_date() - INTERVAL 30 DAYS
                    THEN usage_quantity ELSE 0 END) AS prior
         FROM system.billing.usage
-        WHERE usage_date >= current_date() - INTERVAL 60 DAYS
+        -- two back-to-back 30-day periods, today included (">" avoids a 61st day)
+        WHERE {inventory.billing_scope(ctx, "workspace_id")} AND usage_date > current_date() - INTERVAL 60 DAYS
         """
     )
     days = int(row.get("days") or 0)
@@ -1431,7 +1477,7 @@ def oe_04_02(ctx: Ctx) -> Result:
             WHERE start_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
               AND lower(statement_text) LIKE '%system.billing.usage%'
               AND lower(statement_text) RLIKE
-                  '(forecast|trend|projection|budget|capacity|cumulative|rolling|over \\(|window)'
+                  '(forecast|trend|projection|budget|capacity|cumulative|rolling|over [(]|window)'
             """
         )
     if days == 0:
@@ -1441,14 +1487,15 @@ def oe_04_02(ctx: Ctx) -> Result:
         )
     if prior > 0:
         growth = (recent - prior) / prior * 100
-        trend = f"Consumption changed {growth:+.1f}% versus the prior 30 days"
+        trend = (f"Consumption in {inventory.region_label(ctx)} "
+                 f"changed {growth:+.1f}% versus the prior 30 days")
     else:
         trend = f"Only {days} day(s) of usage history available"
     if forecasting == 0:
         return Result(
             "OE-04-02", "", "", "", STATUS_OPEN,
-            f"No active capacity planning: {days} day(s) of usage history are available "
-            f"({trend}), but no trend or forecast queries against billing data were "
+            f"No active capacity planning: {days} day(s) of usage history in the 60-day "
+            f"trend window ({trend}), but no trend or forecast queries against billing data were "
             "observed, so active capacity planning is not in evidence.",
             {"usage_days": days, "recent_dbus": round(recent, 2),
              "prior_dbus": round(prior, 2), "forecast_queries": 0},

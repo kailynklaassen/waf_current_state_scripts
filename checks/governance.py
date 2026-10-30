@@ -19,23 +19,18 @@ from waf_core import (
     ratio_status,
 )
 
+from checks import inventory
+
 
 def _admin_identities(ctx: Ctx) -> set[str] | None:
-    """Lowercased emails of workspace ``admins`` group members, or ``None`` if the SDK
-    cannot resolve them. Used to tell admin lineage usage from any user's."""
-    w = ctx.w
-    if w is None:
-        return None
-    try:
-        admins: set[str] = set()
-        for g in w.groups.list(filter="displayName eq 'admins'"):
-            for m in (g.members or []):
-                disp = (getattr(m, "display", None) or "").strip().lower()
-                if disp:
-                    admins.add(disp)
-        return admins or None
-    except Exception:
-        return None
+    """Lowercased identities of workspace and account admins across ALL workspaces, from
+    audit grant/revoke events (see :func:`checks.inventory.admin_identities`), or ``None``
+    when the audit log is unreadable. Used to tell admin lineage usage from any user's.
+
+    Replaces the workspace-local ``admins`` group, which only knows the admins of the
+    workspace the assessment happens to run in.
+    """
+    return inventory.admin_identities(ctx)
 
 PILLAR_ID = "data-ai-governance"
 
@@ -159,14 +154,14 @@ def dg_01_03(ctx: Ctx) -> Result:
     admins = _admin_identities(ctx)
     admin_known = admins is not None
     # A query qualifies when the principal is a service principal (jobs show a non-email
-    # identity) or a known workspace admin. When admins can't be resolved we fall back to
+    # identity) or a known workspace/account admin. When admins can't be resolved we fall back to
     # any principal and say so, rather than silently dropping the usage half.
     if admin_known and admins:
         quoted = ", ".join("'" + a.replace("'", "''") + "'" for a in sorted(admins))
         qualifier = f"(executed_by NOT LIKE '%@%' OR lower(executed_by) IN ({quoted}))"
-    elif admin_known:  # resolved, but the admins group is empty -> only SPs qualify
+    elif admin_known:  # resolved, but no admin grants in the window -> only SPs qualify
         qualifier = "executed_by NOT LIKE '%@%'"
-    else:  # SDK unavailable -> count any principal, caveat in the rationale
+    else:  # audit log unavailable -> count any principal, caveat in the rationale
         qualifier = "true"
 
     active_weeks = queries = principals = sp_queries = 0
@@ -219,8 +214,8 @@ def dg_01_03(ctx: Ctx) -> Result:
         )
     elif not admin_known:
         reason += (
-            " The admins group could not be resolved from the SDK, so usage counts "
-            "queries from any principal (not just admins/SPs)."
+            " Admins could not be resolved from the audit log (setAdmin/setAccountAdmin "
+            "events), so usage counts queries from any principal (not just admins/SPs)."
         )
     if active_weeks == 0 and history_available:
         reason += (
@@ -328,13 +323,8 @@ def dg_01_05(ctx: Ctx) -> Result:
 def dg_01_06(ctx: Ctx) -> Result:
     """Govern AI assets together with data (models and functions in Unity Catalog)."""
     scope = ctx.scope
-    uc_models = None
-    w = ctx.w
-    if w is not None:
-        try:
-            uc_models = sum(1 for _ in w.registered_models.list())
-        except Exception:
-            uc_models = None
+    # Same scope as the functions below: only models in in-scope schemas.
+    uc_models = inventory.scoped_model_count(ctx)
 
     uc_functions = ctx.count(
         f"""
@@ -372,17 +362,17 @@ def dg_01_06(ctx: Ctx) -> Result:
     if models_n > 0 and uc_functions > 0:
         status = STATUS_COMPLETED
         reason = (
-            f"AI assets are governed in Unity Catalog alongside data: {models_n} "
-            f"registered model(s) and {uc_functions} UC function(s) "
+            f"AI assets are governed in Unity Catalog alongside data in {scope.label}: "
+            f"{models_n} registered model(s) and {uc_functions} UC function(s) "
             f"({ws_experiments} MLflow experiment(s) tracked)."
         )
     else:
         status = STATUS_IN_PROGRESS
         missing = "UC-registered models" if models_n == 0 else "UC functions"
         reason = (
-            f"AI governance in Unity Catalog is partial: {models_n} registered model(s) "
-            f"and {uc_functions} UC function(s) ({ws_experiments} MLflow experiment(s) "
-            f"tracked). Both models and functions should be governed in UC - {missing} "
+            f"AI governance in Unity Catalog is partial in {scope.label}: {models_n} "
+            f"registered model(s) and {uc_functions} UC function(s) ({ws_experiments} "
+            f"MLflow experiment(s) tracked). Both models and functions should be governed in UC - {missing} "
             "are absent."
         )
     return Result(
@@ -478,7 +468,9 @@ def dg_02_02(ctx: Ctx) -> Result:
                max(event_date) AS last_day,
                datediff(current_date(), min(event_date)) + 1 AS span_days
         FROM system.access.audit
-        WHERE event_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+        -- ">" so the window is exactly lookback_days calendar days, today included;
+        -- ">=" spans one extra day and scored 91 of 90.
+        WHERE event_date > current_date() - INTERVAL {ctx.lookback_days} DAYS
         """
     )
     events = int(row.get("events") or 0)
@@ -601,7 +593,7 @@ def dg_03_02(ctx: Ctx) -> Result:
     pipelines = 0
     if ctx.has_table("system.lakeflow.pipelines"):
         pipelines = ctx.count_safe(
-            "SELECT count(*) AS n FROM system.lakeflow.pipelines WHERE delete_time IS NULL"
+            inventory.live_count_sql("pipelines")
         )
     constrained = ctx.count(
         f"""

@@ -20,19 +20,14 @@ from waf_core import (
     ratio_status,
 )
 
+from checks import cloud, inventory
+
 PILLAR_ID = "cost-optimization"
 
 #: CO-01-04 reference: a cluster is "up to date" if its DBR major is within this many
 #: versions of the newest major actually seen in the workspace fleet. Self-calibrating
 #: so it never goes stale; override with an absolute bar via cfg["current_dbr_major"].
 DEFAULT_DBR_MAJOR_TOLERANCE = 2
-
-#: CO-01-07 current-generation instance-family tokens (substring match on node type).
-#: Config-overridable via cfg["modern_instance_families"]; broadened to current AWS gens.
-DEFAULT_MODERN_INSTANCE_FAMILIES = [
-    "c5", "c6", "c7", "c8", "d3", "d4", "d5", "e2", "e4", "e5", "i3", "i4", "im4", "is4",
-    "m5", "m6", "m7", "m8", "n2", "r5", "r6", "r7", "r8",
-]
 
 #: CO-03-03 chargeback tag-key tokens (RLIKE, case-insensitive). A billing record is
 #: "attributable" if any custom tag key matches one of these. Override in 00_config
@@ -79,38 +74,54 @@ def co_01_02(ctx: Ctx) -> Result:
     Binary by design: any job running on all-purpose compute is a cost anti-pattern
     (all-purpose lists at ~2-4x the job-compute rate), so there is no partial credit -
     any such job -> open with the count; none -> completed.
+
+    Measured from task runs: a task whose compute is a UI- or API-created cluster ran on
+    all-purpose compute. Billing cannot show this - it does not record the job on
+    all-purpose usage, so a billing-based count is always zero.
     """
-    if not ctx.has_table("system.billing.usage"):
+    if not (ctx.has_table("system.lakeflow.job_task_run_timeline")
+            and ctx.has_table("system.compute.clusters")):
         return Result(
             "CO-01-02", "", "", "", STATUS_OPEN,
-            "system.billing.usage is not readable, so job compute type cannot be assessed.",
+            "system.lakeflow.job_task_run_timeline or system.compute.clusters is not "
+            "readable, so job compute type cannot be assessed.",
         )
     row = ctx.one(
         f"""
-        SELECT count(DISTINCT usage_metadata.job_id) AS jobs_on_ap,
-               round(sum(usage_quantity), 2) AS ap_dbus
-        FROM system.billing.usage
-        WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
-          AND lower(coalesce(sku_name, '')) LIKE '%all_purpose%'
-          AND usage_metadata.job_id IS NOT NULL
+        WITH tasks AS (
+          SELECT workspace_id, job_id, job_run_id, explode(compute_ids) AS cluster_id
+          FROM system.lakeflow.job_task_run_timeline
+          WHERE period_start_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
+        ),
+        all_purpose AS (
+          SELECT DISTINCT workspace_id, cluster_id FROM system.compute.clusters
+          WHERE upper(coalesce(cluster_source, '')) IN ('UI', 'API')
+        )
+        SELECT count(DISTINCT t.workspace_id, t.job_id) AS jobs_on_ap,
+               count(DISTINCT t.workspace_id, t.job_run_id) AS runs_on_ap,
+               (SELECT count(DISTINCT workspace_id, job_id) FROM tasks) AS jobs_ran
+        FROM tasks t
+        JOIN all_purpose a ON t.workspace_id = a.workspace_id AND t.cluster_id = a.cluster_id
         """
     )
     jobs_on_ap = int(row.get("jobs_on_ap") or 0)
-    ap_dbus = float(row.get("ap_dbus") or 0)
+    runs_on_ap = int(row.get("runs_on_ap") or 0)
+    jobs_ran = int(row.get("jobs_ran") or 0)
     if jobs_on_ap == 0:
         return Result(
             "CO-01-02", "", "", "", STATUS_COMPLETED,
-            f"No jobs ran on all-purpose compute in the last {ctx.lookback_days} days; "
-            "automated workloads use job or serverless compute.",
-            {"jobs_on_all_purpose": 0},
+            f"No jobs ran on all-purpose compute in the last {ctx.lookback_days} days "
+            f"({jobs_ran:,} job(s) ran); automated workloads use job or serverless compute.",
+            {"jobs_on_all_purpose": 0, "jobs_ran": jobs_ran},
         )
     return Result(
         "CO-01-02", "", "", "", STATUS_OPEN,
-        f"{jobs_on_ap:,} job(s) ran on all-purpose compute in the last "
-        f"{ctx.lookback_days} days ({ap_dbus:,.0f} all-purpose DBU attributed to jobs). "
-        "All-purpose lists at roughly 2-4x the job-compute rate - move these scheduled "
-        "workloads onto job clusters.",
-        {"jobs_on_all_purpose": jobs_on_ap, "all_purpose_job_dbus": round(ap_dbus, 2)},
+        f"{jobs_on_ap:,} of {jobs_ran:,} job(s) that ran in the last {ctx.lookback_days} "
+        f"days ran tasks on all-purpose compute ({runs_on_ap:,} run(s)). All-purpose "
+        "lists at roughly 2-4x the job-compute rate - move these scheduled workloads "
+        "onto job clusters or serverless.",
+        {"jobs_on_all_purpose": jobs_on_ap, "runs_on_all_purpose": runs_on_ap,
+         "jobs_ran": jobs_ran},
     )
 
 
@@ -155,30 +166,35 @@ def co_01_04(ctx: Ctx) -> Result:
             "system.compute.clusters is not readable, so runtime versions cannot be "
             "assessed.",
         )
+    # Pipelines are excluded: Databricks manages their runtime through the pipeline
+    # channel (reported as "dlt:<version>"), so there is no DBR choice to score.
     rows = ctx.sql(
         f"""
-        WITH latest AS (
-          SELECT cluster_id, dbr_version,
-                 row_number() OVER (PARTITION BY cluster_id ORDER BY change_time DESC) AS rn
-          FROM system.compute.clusters
-          WHERE delete_time IS NULL
-            AND change_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-        )
-        SELECT try_cast(regexp_extract(coalesce(dbr_version, ''), '^([0-9]+)', 1) AS INT) AS major,
+        {inventory.workloads_cte(ctx, 'cluster_id, dbr_version')}
+        SELECT upper(coalesce(cluster_source, '')) LIKE 'PIPELINE%' AS pipeline,
+               try_cast(regexp_extract(coalesce(dbr_version, ''), '^([0-9]+)', 1) AS INT) AS major,
                count(*) AS n
         FROM latest WHERE rn = 1
-        GROUP BY 1
+        GROUP BY 1, 2
         """
     )
-    by_major = {int(r["major"]): int(r["n"]) for r in rows if r["major"] is not None}
+    pipelines = sum(int(r["n"]) for r in rows if r["pipeline"])
+    by_major: dict[int, int] = {}
+    for r in rows:
+        if not r["pipeline"] and r["major"] is not None:
+            by_major[int(r["major"])] = by_major.get(int(r["major"]), 0) + int(r["n"])
     total = sum(by_major.values())
+    unit = (f"classic compute workloads (jobs and all-purpose clusters, each counted "
+            f"once) that ran {inventory.window_text(ctx)}")
+    pipeline_note = (f" {pipelines:,} pipeline workload(s) are excluded because Databricks "
+                     "manages their runtime through the pipeline channel.")
     if total == 0:
         return Result(
             "CO-01-04", "", "", "", STATUS_COMPLETED,
             f"No classic clusters with a parseable runtime active in the last "
             f"{ctx.lookback_days} days; serverless compute is always on a current, "
-            "Databricks-managed runtime.",
-            {"clusters": 0},
+            "Databricks-managed runtime." + (pipeline_note if pipelines else ""),
+            {"clusters": 0, "pipeline_workloads_excluded": pipelines},
         )
     newest = max(by_major)
     oldest = min(by_major)
@@ -193,26 +209,61 @@ def co_01_04(ctx: Ctx) -> Result:
         else f"DBR {threshold}.x or newer (within {DEFAULT_DBR_MAJOR_TOLERANCE} major "
              f"version(s) of the fleet's newest, DBR {newest}.x)"
     )
+    # Context: share of classic-compute DBUs on a current runtime (spend-weighted view).
+    dbu_note = ""
+    if ctx.has_table("system.billing.usage"):
+        try:
+            drows = ctx.sql(
+                f"""
+                WITH c AS (
+                  SELECT cluster_id,
+                         try_cast(regexp_extract(coalesce(dbr_version, ''), '^([0-9]+)', 1) AS INT) AS major,
+                         row_number() OVER (PARTITION BY cluster_id ORDER BY change_time DESC) AS rn
+                  FROM system.compute.clusters
+                  WHERE change_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
+                )
+                SELECT c.major, sum(u.usage_quantity) AS dbu
+                FROM system.billing.usage u
+                JOIN c ON u.usage_metadata.cluster_id = c.cluster_id AND c.rn = 1
+                WHERE {inventory.billing_scope(ctx, "u.workspace_id")} AND u.usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+                GROUP BY c.major
+                """
+            )
+            dbu_total = sum(float(r["dbu"] or 0) for r in drows if r.get("major") is not None)
+            dbu_current = sum(float(r["dbu"] or 0) for r in drows
+                              if r.get("major") is not None and int(r["major"]) >= threshold)
+            if dbu_total > 0:
+                dbu_note = (f" Spend-weighted: {100 * dbu_current / dbu_total:.1f}% of classic "
+                            f"compute DBUs ({dbu_current:,.0f} of {dbu_total:,.0f}) ran on DBR "
+                            f"{threshold}.x or newer.")
+        except Exception:
+            dbu_note = ""
     return ratio_result(
         "CO-01-04",
         current,
         total,
-        f"active clusters run {ref}",
+        f"{unit} run {ref}",
         complete_at=ctx.complete_at,
         extra=(
-            f"Runtime spread: newest DBR {newest}.x, oldest DBR {oldest}.x. Newer "
-            "runtimes deliver free performance (and therefore cost) improvements."
+            f"{total - current:,} of {total:,} workloads (jobs, all-purpose clusters) "
+            f"that ran {inventory.window_text(ctx)} use an outdated runtime "
+            f"(DBR {threshold - 1}.x or older). Runtime spread: newest DBR {newest}.x, "
+            f"oldest DBR {oldest}.x."
+            + (pipeline_note if pipelines else "")
+            + dbu_note
+            + " Newer runtimes deliver free performance (and therefore cost) improvements."
         ),
         metrics={"oldest_dbr_major": oldest, "newest_dbr_major": newest,
-                 "threshold_major": threshold, "threshold_configured": bool(configured)},
+                 "threshold_major": threshold, "threshold_configured": bool(configured),
+                 "pipeline_workloads_excluded": pipelines},
     )
 
 
 def co_01_05(ctx: Ctx) -> Result:
     """Only use GPUs for the right workloads.
 
-    GPU usage is identified from the AWS GPU node families (g*/p*) in
-    system.billing.usage. If there is no GPU spend, there is nothing to misuse ->
+    GPU usage is identified from the GPU node families for CLOUD_PROVIDER
+    (checks/cloud.py) in system.billing.usage. If there is no GPU spend, there is nothing to misuse ->
     completed. If GPUs ARE in use, whether each workload is the *right* use (deep
     learning / LLM training or inference) cannot be confirmed from telemetry: MLflow
     linkage covers <2% of GPU spend, and GPU-on-a-job is frequently legitimate ML
@@ -230,10 +281,10 @@ def co_01_05(ctx: Ctx) -> Result:
                round(sum(CASE WHEN usage_metadata.job_id IS NOT NULL
                                OR usage_metadata.dlt_pipeline_id IS NOT NULL
                               THEN usage_quantity ELSE 0 END), 2) AS gpu_automated,
-               count(DISTINCT usage_metadata.job_id) AS gpu_jobs
+               count(DISTINCT workspace_id, usage_metadata.job_id) AS gpu_jobs
         FROM system.billing.usage
-        WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
-          AND lower(coalesce(usage_metadata.node_type, '')) RLIKE '^(g[0-9]|p[0-9])'
+        WHERE {inventory.billing_scope(ctx, "workspace_id")} AND usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+          AND lower(coalesce(usage_metadata.node_type, '')) RLIKE '{cloud.gpu_regex(ctx)}'
         """
     )
     gpu = float(row.get("gpu_dbu") or 0)
@@ -242,14 +293,17 @@ def co_01_05(ctx: Ctx) -> Result:
     if gpu <= 0:
         return Result(
             "CO-01-05", "", "", "", STATUS_COMPLETED,
-            f"No GPU DBUs consumed in the last {ctx.lookback_days} days, so there is no "
-            "GPU spend to place on the wrong workload.",
-            {"gpu_dbus": 0.0},
+            f"No GPU DBUs consumed in {inventory.region_label(ctx)} "
+            f"in the last {ctx.lookback_days} days ({ctx.cloud.upper()} "
+            "GPU instance families), so there is no GPU spend to place on the wrong "
+            "workload.",
+            {"gpu_dbus": 0.0, "cloud": ctx.cloud},
         )
     interactive = max(gpu - automated, 0)
     return Result(
         "CO-01-05", "", "", "", STATUS_MANUAL,
-        f"GPU compute is in use ({gpu:,.0f} DBU in the last {ctx.lookback_days} days: "
+        f"GPU compute is in use ({gpu:,.0f} DBU in {inventory.region_label(ctx)} "
+        f"in the last {ctx.lookback_days} days: "
         f"{automated:,.0f} on jobs/pipelines across {gpu_jobs} job(s), {interactive:,.0f} "
         "interactive/other). Whether each GPU workload is the right use (deep learning / "
         "LLM training or inference) cannot be confirmed from system tables - MLflow "
@@ -277,7 +331,7 @@ def co_01_06(ctx: Ctx) -> Result:
           sum(CASE WHEN coalesce(product_features.is_serverless, lower(coalesce(sku_name, '')) LIKE '%serverless%')
                    THEN usage_quantity ELSE 0 END) AS serverless
         FROM system.billing.usage
-        WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+        WHERE {inventory.billing_scope(ctx, "workspace_id")} AND usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
         """
     )
     total = float(row.get("total") or 0)
@@ -291,7 +345,8 @@ def co_01_06(ctx: Ctx) -> Result:
         "CO-01-06",
         int(round(serverless)),
         int(round(total)),
-        f"DBUs in the last {ctx.lookback_days} days run on serverless compute",
+        f"DBUs in {inventory.region_label(ctx)} "
+        f"in the last {ctx.lookback_days} days run on serverless compute",
         complete_at=ctx.complete_at,
         extra="Serverless removes idle time and start-up waste from the bill.",
         metrics={"serverless_dbus": round(serverless, 2), "total_dbus": round(total, 2)},
@@ -308,16 +363,10 @@ def co_01_07(ctx: Ctx) -> Result:
         )
     rows = ctx.sql(
         f"""
-        WITH latest AS (
-          SELECT cluster_id, worker_node_type, driver_node_type,
-                 row_number() OVER (PARTITION BY cluster_id ORDER BY change_time DESC) AS rn
-          FROM system.compute.clusters
-          WHERE delete_time IS NULL
-            AND change_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-        )
-        SELECT coalesce(worker_node_type, 'unknown') AS node_type, count(*) AS n
-        FROM latest WHERE rn = 1
-        GROUP BY 1 ORDER BY 2 DESC LIMIT 8
+        {inventory.workloads_cte(ctx, 'cluster_id, worker_node_type, driver_node_type')}
+        SELECT coalesce(worker_node_type, driver_node_type) AS node_type, count(*) AS n
+        FROM latest WHERE rn = 1 AND coalesce(worker_node_type, driver_node_type) IS NOT NULL
+        GROUP BY 1 ORDER BY 2 DESC
         """
     )
     if not rows:
@@ -327,28 +376,28 @@ def co_01_07(ctx: Ctx) -> Result:
             "compute selects instance types automatically.",
             {"clusters": 0},
         )
-    total = sum(int(r["n"]) for r in rows)
-    # Latest-generation families are materially cheaper per unit of work. The family
-    # list is config-driven so it can track new instance generations.
-    fams = [f.lower() for f in
-            (ctx.cfg.get("modern_instance_families") or DEFAULT_MODERN_INSTANCE_FAMILIES)]
-    modern = sum(
-        int(r["n"])
-        for r in rows
-        if any(tok in str(r["node_type"]).lower() for tok in fams)
-    )
-    mix = ", ".join(f"{r['node_type']}={r['n']}" for r in rows)
+    # Latest-generation instances are materially cheaper per unit of work. GPUs are
+    # left out: their generations follow the accelerator, and CO-01-05 covers them.
+    cpu = [r for r in rows if not cloud.is_gpu(ctx, r["node_type"])]
+    gpu_workloads = sum(int(r["n"]) for r in rows) - sum(int(r["n"]) for r in cpu)
+    total = sum(int(r["n"]) for r in cpu)
+    modern = sum(int(r["n"]) for r in cpu if cloud.is_current_generation(ctx, r["node_type"]))
+    mix = ", ".join(f"{r['node_type']}={r['n']}" for r in rows[:8])
     return ratio_result(
         "CO-01-07",
         modern,
         total,
-        "active clusters use a current-generation instance family",
+        f"{inventory.workload_unit(ctx)} on CPU instances use a current-generation "
+        "instance type",
         complete_at=ctx.complete_at,
         extra=(
-            f"Instance mix: {mix}. Right-sizing means matching memory/compute/IO to the "
-            "workload, which needs a per-job review."
+            f"Current generation = {cloud.generation_rule(ctx)}. "
+            f"{gpu_workloads} GPU workload(s) are excluded (see CO-01-05). "
+            f"Top instance types: {mix}. Right-sizing means matching memory/compute/IO "
+            "to the workload, which needs a per-job review."
         ),
-        metrics={"node_type_mix": {r["node_type"]: r["n"] for r in rows}},
+        metrics={"node_type_mix": {r["node_type"]: r["n"] for r in rows},
+                 "gpu_workloads": gpu_workloads, "cloud": ctx.cloud},
     )
 
 
@@ -421,7 +470,7 @@ def co_01_09(ctx: Ctx) -> Result:
           sum(CASE WHEN upper(coalesce(billing_origin_product, '')) IN ('SQL', 'DATABRICKS_SQL')
                    THEN usage_quantity ELSE 0 END) AS sql_warehouse
         FROM system.billing.usage
-        WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+        WHERE {inventory.billing_scope(ctx, "workspace_id")} AND usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
         """
     )
     total = float(row.get("total") or 0)
@@ -436,7 +485,8 @@ def co_01_09(ctx: Ctx) -> Result:
         "CO-01-09",
         int(round(photon)),
         int(round(total)),
-        f"DBUs in the last {ctx.lookback_days} days run on the Photon vectorized engine "
+        f"DBUs in {inventory.region_label(ctx)} "
+        f"in the last {ctx.lookback_days} days run on the Photon vectorized engine "
         "(product_features.is_photon)",
         complete_at=ctx.complete_at,
         extra=(
@@ -463,13 +513,7 @@ def co_02_01(ctx: Ctx) -> Result:
         )
     row = ctx.one(
         f"""
-        WITH latest AS (
-          SELECT cluster_id, min_autoscale_workers, max_autoscale_workers,
-                 row_number() OVER (PARTITION BY cluster_id ORDER BY change_time DESC) AS rn
-          FROM system.compute.clusters
-          WHERE delete_time IS NULL
-            AND change_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-        )
+        {inventory.workloads_cte(ctx, 'cluster_id, min_autoscale_workers, max_autoscale_workers')}
         SELECT count(*) AS total,
                count_if(max_autoscale_workers IS NOT NULL
                         AND max_autoscale_workers > coalesce(min_autoscale_workers, 0)) AS autoscaling
@@ -484,12 +528,12 @@ def co_02_01(ctx: Ctx) -> Result:
         wrow = ctx.one(
             """
             WITH latest AS (
-              SELECT warehouse_id, min_clusters, max_clusters,
+              SELECT warehouse_id, delete_time, min_clusters, max_clusters,
                      row_number() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) AS rn
-              FROM system.compute.warehouses WHERE delete_time IS NULL
+              FROM system.compute.warehouses
             )
             SELECT count(*) AS total, count_if(max_clusters > coalesce(min_clusters, 1)) AS scaling
-            FROM latest WHERE rn = 1
+            FROM latest WHERE rn = 1 AND delete_time IS NULL
             """
         )
         wh_total = int(wrow.get("total") or 0)
@@ -507,11 +551,12 @@ def co_02_01(ctx: Ctx) -> Result:
         "CO-02-01",
         combined_scaling,
         combined_total,
-        "compute resources (clusters and SQL warehouses) are configured to scale "
-        "elastically with load",
+        "compute resources (classic compute workloads - jobs, pipelines and all-purpose "
+        f"clusters, each counted once - that ran {inventory.window_text(ctx)}, plus SQL "
+        "warehouses) are configured to scale elastically with load",
         complete_at=ctx.complete_at,
         extra=(
-            f"Clusters: {autoscaling}/{total} autoscaling. "
+            f"Cluster workloads: {autoscaling}/{total} autoscaling. "
             f"Warehouses: {wh_scaling}/{wh_total} multi-cluster."
         ),
         metrics={"clusters_autoscaling": autoscaling, "clusters_total": total,
@@ -529,13 +574,7 @@ def co_02_02(ctx: Ctx) -> Result:
         )
     row = ctx.one(
         f"""
-        WITH latest AS (
-          SELECT cluster_id, auto_termination_minutes, cluster_source,
-                 row_number() OVER (PARTITION BY cluster_id ORDER BY change_time DESC) AS rn
-          FROM system.compute.clusters
-          WHERE delete_time IS NULL
-            AND change_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-        )
+        {inventory.workloads_cte(ctx, 'cluster_id, auto_termination_minutes, cluster_source')}
         SELECT count(*) AS total,
                count_if(auto_termination_minutes IS NOT NULL
                         AND auto_termination_minutes > 0) AS terminating,
@@ -553,13 +592,13 @@ def co_02_02(ctx: Ctx) -> Result:
         wrow = ctx.one(
             """
             WITH latest AS (
-              SELECT warehouse_id, auto_stop_minutes,
+              SELECT warehouse_id, delete_time, auto_stop_minutes,
                      row_number() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) AS rn
-              FROM system.compute.warehouses WHERE delete_time IS NULL
+              FROM system.compute.warehouses
             )
             SELECT count(*) AS total,
                    count_if(auto_stop_minutes IS NOT NULL AND auto_stop_minutes > 0) AS stopping
-            FROM latest WHERE rn = 1
+            FROM latest WHERE rn = 1 AND delete_time IS NULL
             """
         )
         wh_total = int(wrow.get("total") or 0)
@@ -576,10 +615,11 @@ def co_02_02(ctx: Ctx) -> Result:
         "CO-02-02",
         terminating + wh_stop,
         combined_total,
-        "interactive clusters and SQL warehouses have auto-termination / auto-stop set",
+        f"all-purpose clusters that ran {inventory.window_text(ctx)} and current SQL "
+        "warehouses have auto-termination / auto-stop set",
         complete_at=ctx.complete_at,
         extra=(
-            f"Clusters: {terminating}/{total} terminate automatically"
+            f"All-purpose clusters: {terminating}/{total} terminate automatically"
             + (
                 f", of which {generous} wait longer than 120 minutes."
                 if generous
@@ -600,30 +640,18 @@ def co_02_03(ctx: Ctx) -> Result:
     count for 50%:
 
     * **Policies exist (50%)** - at least one cluster policy is defined.
-    * **Enforcement (50%)** - the share of active clusters created under a policy.
+    * **Enforcement (50%)** - the share of compute workloads created under a policy.
 
     Blended score = 0.5 * (policies exist) + 0.5 * (governed / total clusters), then the
     standard thresholds. Policies that exist but govern nothing cap at ~50%.
     """
-    policies = None
-    w = ctx.w
-    if w is not None:
-        try:
-            policies = sum(1 for _ in w.cluster_policies.list())
-        except Exception:
-            policies = None
+    pol = inventory.policy_evidence(ctx)
 
     total = governed = 0
     if ctx.has_table("system.compute.clusters"):
         row = ctx.one(
             f"""
-            WITH latest AS (
-              SELECT cluster_id, policy_id,
-                     row_number() OVER (PARTITION BY cluster_id ORDER BY change_time DESC) AS rn
-              FROM system.compute.clusters
-              WHERE delete_time IS NULL
-                AND change_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-            )
+            {inventory.workloads_cte(ctx, 'cluster_id, policy_id')}
             SELECT count(*) AS total,
                    count_if(policy_id IS NOT NULL AND policy_id <> '') AS governed
             FROM latest WHERE rn = 1
@@ -632,24 +660,23 @@ def co_02_03(ctx: Ctx) -> Result:
         total = int(row.get("total") or 0)
         governed = int(row.get("governed") or 0)
 
-    # Policies exist if the SDK saw any, or (SDK unavailable) if any cluster cites one.
-    if policies is None and not ctx.has_table("system.compute.clusters"):
+    # Policies exist if any custom policy is registered or any active cluster cites one.
+    if pol["exist"] is None and not ctx.has_table("system.compute.clusters"):
         return Result(
             "CO-02-03", "", "", "", STATUS_OPEN,
-            "Neither cluster policies (SDK) nor cluster records are readable, so cost "
-            "guardrails cannot be assessed.",
+            "Neither the cluster policy inventory (audit log) nor cluster records are "
+            "readable, so cost guardrails cannot be assessed.",
             {"policies": None},
         )
-    have_policies = bool(policies) or governed > 0
+    have_policies = bool(pol["exist"]) or governed > 0
     policies_half = 1.0 if have_policies else 0.0
     enforce_half = (governed / total) if total > 0 else 0.0
     score = 0.5 * policies_half + 0.5 * enforce_half
     status, _ = ratio_status(round(score * 10_000), 10_000, ctx.complete_at)
 
-    pol_txt = (f"{policies} policy/policies defined" if policies is not None
-               else ("policies in use (SDK inventory unavailable)" if governed > 0
-                     else "no policies detected (SDK inventory unavailable)"))
-    enforce_txt = (f"{governed:,} of {total:,} active clusters created under a policy "
+    pol_txt = pol["text"]
+    enforce_txt = (f"{governed:,} of {total:,} classic compute workloads (jobs, pipelines, "
+                   f"all-purpose clusters) that ran {inventory.window_text(ctx)} run under a policy "
                    f"({enforce_half * 100:.1f}%)" if total > 0
                    else f"no clusters active in the last {ctx.lookback_days} days to "
                         "measure enforcement")
@@ -659,7 +686,7 @@ def co_02_03(ctx: Ctx) -> Result:
     )
     return Result(
         "CO-02-03", "", "", "", status, reason,
-        {"policies": policies, "governed_clusters": governed, "total_clusters": total,
+        {**pol["metrics"], "governed_clusters": governed, "total_clusters": total,
          "policies_exist": have_policies, "enforcement_pct": round(enforce_half * 100, 2),
          "blended_pct": round(score * 100, 2)},
     )
@@ -680,7 +707,7 @@ def co_03_01(ctx: Ctx) -> Result:
     days = ctx.count(
         f"""
         SELECT count(DISTINCT usage_date) AS n FROM system.billing.usage
-        WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+        WHERE {inventory.billing_scope(ctx, "workspace_id")} AND usage_date > current_date() - INTERVAL {ctx.lookback_days} DAYS
         """
     )
     consumers = 0
@@ -714,7 +741,8 @@ def co_03_01(ctx: Ctx) -> Result:
         "CO-03-01", "", "", "", STATUS_COMPLETED,
         f"Costs are actively monitored: {queries:,} query/queries against "
         f"system.billing.usage by {consumers} principal(s) over the last "
-        f"{ctx.lookback_days} days, backed by {days} day(s) of usage data.",
+        f"{ctx.lookback_days} days, backed by {days} day(s) of usage data in "
+        f"{inventory.region_label(ctx)}.",
         {"usage_days": days, "billing_queries": queries, "consumers": consumers},
     )
 
@@ -731,7 +759,7 @@ def co_03_02(ctx: Ctx) -> Result:
         SELECT count(*) AS total,
                count_if(custom_tags IS NOT NULL AND size(map_keys(custom_tags)) > 0) AS tagged
         FROM system.billing.usage
-        WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+        WHERE {inventory.billing_scope(ctx, "workspace_id")} AND usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
         """
     )
     total = int(row.get("total") or 0)
@@ -741,7 +769,7 @@ def co_03_02(ctx: Ctx) -> Result:
         SELECT k AS tag_key, count(*) AS n
         FROM system.billing.usage
         LATERAL VIEW explode(map_keys(coalesce(custom_tags, map()))) t AS k
-        WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+        WHERE {inventory.billing_scope(ctx, "workspace_id")} AND usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
         GROUP BY 1 ORDER BY 2 DESC LIMIT 8
         """
     )
@@ -750,7 +778,8 @@ def co_03_02(ctx: Ctx) -> Result:
         "CO-03-02",
         tagged,
         total,
-        f"billing records in the last {ctx.lookback_days} days carry custom tags for "
+        f"billing records in {inventory.region_label(ctx)} "
+        f"in the last {ctx.lookback_days} days carry custom tags for "
         "cost attribution",
         complete_at=ctx.complete_at,
         none_found=(
@@ -796,7 +825,7 @@ def co_03_03(ctx: Ctx) -> Result:
                         k -> lower(k) RLIKE '{tag_regex}')
                ) AS attributable
         FROM system.billing.usage
-        WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+        WHERE {inventory.billing_scope(ctx, "workspace_id")} AND usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
         """
     )
     total = int(row.get("total") or 0)
@@ -819,7 +848,8 @@ def co_03_03(ctx: Ctx) -> Result:
         "CO-03-03",
         attributable,
         total,
-        "billing records carry a chargeback dimension (cost centre, team, project, "
+        f"billing records in {inventory.region_label(ctx)} "
+        f"carry a chargeback dimension (cost centre, team, project, "
         "owner or environment tag)",
         complete_at=ctx.complete_at,
         none_found=(
@@ -928,7 +958,7 @@ def co_03_05(ctx: Ctx) -> Result:
         egress = ctx.count_safe(
             f"""
             SELECT count(*) AS n FROM system.billing.usage
-            WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+            WHERE {inventory.billing_scope(ctx, "workspace_id")} AND usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
               AND (lower(coalesce(sku_name, '')) LIKE '%internet%'
                    OR lower(coalesce(sku_name, '')) LIKE '%egress%'
                    OR lower(coalesce(billing_origin_product, '')) LIKE '%sharing%')
@@ -943,15 +973,18 @@ def co_03_05(ctx: Ctx) -> Result:
         return Result(
             "CO-03-05", "", "", "", STATUS_OPEN,
             f"Delta Sharing is in use ({shares} share(s), {recipients} recipient(s)) but "
-            f"no egress or sharing-related billing records appear in the last "
-            f"{ctx.lookback_days} days, so egress cost is not being observed or tracked.",
+            f"no egress or sharing-related billing records appear in "
+            f"{inventory.region_label(ctx)} in the last {ctx.lookback_days} days, so "
+            "egress cost is not being observed or tracked.",
             {"shares": shares, "recipients": recipients, "egress_records": 0,
              "materializations": materializations},
         )
     return Result(
         "CO-03-05", "", "", "", STATUS_COMPLETED,
-        f"Delta Sharing egress is visible in billing: {egress:,} record(s) over the last "
-        f"{ctx.lookback_days} days across {shares} share(s) and {recipients} recipient(s).",
+        f"Delta Sharing egress is visible in billing: {egress:,} record(s) in "
+        f"{inventory.region_label(ctx)} over the last {ctx.lookback_days} days, across "
+        f"{shares} share(s) and {recipients} recipient(s) in this metastore (shares are "
+        "metastore-level, so not limited to the production catalogs).",
         {"shares": shares, "recipients": recipients, "egress_records": egress,
          "materializations": materializations},
     )
@@ -971,12 +1004,8 @@ def co_04_01(ctx: Ctx) -> Result:
             "assessed.",
         )
     row = ctx.one(
-        """
-        WITH latest AS (
-          SELECT pipeline_id, settings,
-                 row_number() OVER (PARTITION BY pipeline_id ORDER BY change_time DESC) AS rn
-          FROM system.lakeflow.pipelines WHERE delete_time IS NULL
-        )
+        f"""
+        WITH {inventory.live_latest_cte("pipelines", "pipeline_id, settings")}
         SELECT count(*) AS total,
                count_if(settings.continuous = true) AS continuous,
                count_if(settings.development = true) AS development
@@ -990,12 +1019,8 @@ def co_04_01(ctx: Ctx) -> Result:
     continuous_jobs = 0
     if ctx.has_table("system.lakeflow.jobs"):
         continuous_jobs = ctx.count_safe(
-            """
-            WITH latest AS (
-              SELECT job_id, trigger,
-                     row_number() OVER (PARTITION BY job_id ORDER BY change_time DESC) AS rn
-              FROM system.lakeflow.jobs WHERE delete_time IS NULL
-            )
+            f"""
+            WITH {inventory.live_latest_cte("jobs", "job_id, trigger")}
             SELECT count(*) AS n FROM latest
             WHERE rn = 1 AND trigger.continuous.enabled = true
             """
@@ -1042,23 +1067,13 @@ def co_04_02(ctx: Ctx) -> Result:
             "CO-04-02", "", "", "", STATUS_OPEN,
             "system.compute.clusters is not readable, so spot usage cannot be assessed.",
         )
-    # Spot configuration lives in cloud-specific attribute structs; probe whichever
-    # this workspace's cloud populates.
+    # Spot configuration lives in a cloud-specific attribute struct; CLOUD_PROVIDER picks
+    # which availability field to read (any substring match hits attribute key names).
     row = ctx.one(
         f"""
-        WITH latest AS (
-          SELECT cluster_id, aws_attributes, azure_attributes, gcp_attributes,
-                 row_number() OVER (PARTITION BY cluster_id ORDER BY change_time DESC) AS rn
-          FROM system.compute.clusters
-          WHERE delete_time IS NULL
-            AND change_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-        )
+        {inventory.workloads_cte(ctx, 'cluster_id, aws_attributes, azure_attributes, gcp_attributes')}
         SELECT count(*) AS total,
-               count_if(
-                 coalesce(try_cast(aws_attributes.first_on_demand AS INT), 999) < 999
-                 OR lower(coalesce(to_json(azure_attributes), '')) LIKE '%spot%'
-                 OR lower(coalesce(to_json(gcp_attributes), '')) LIKE '%preemptible%'
-               ) AS spot_aware
+               count_if({cloud.spot_sql(ctx)}) AS spot_aware
         FROM latest WHERE rn = 1
         """
     )
@@ -1075,13 +1090,14 @@ def co_04_02(ctx: Ctx) -> Result:
         "CO-04-02",
         spot,
         total,
-        "active clusters are configured to use spot / preemptible capacity for workers",
+        f"{inventory.workload_unit(ctx)} are configured to use spot / preemptible capacity for workers",
         complete_at=ctx.complete_at,
         extra=(
-            "Spot capacity cuts worker cost substantially but can be reclaimed, so keep "
-            "the driver and latency-critical production work on-demand."
+            f"Spot = {cloud.spot_sql(ctx)}. Spot capacity cuts worker cost substantially "
+            "but can be reclaimed, so keep the driver and latency-critical production "
+            "work on-demand."
         ),
-        metrics={"spot_aware_clusters": spot},
+        metrics={"spot_aware_clusters": spot, "cloud": ctx.cloud},
     )
 
 

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import traceback
 import uuid
@@ -49,6 +50,9 @@ STATUS_ICON = {
     STATUS_COMPLETED: "[x]",
     STATUS_MANUAL: "[?]",
 }
+
+#: Values accepted for ``cfg["cloud_provider"]`` (``CLOUD_PROVIDER`` in 00_config).
+CLOUD_PROVIDERS = ("azure", "aws", "gcp")
 
 
 # --------------------------------------------------------------------------------------
@@ -230,6 +234,13 @@ def _like_clause(col: str, patterns: Sequence[str], negate: bool = False) -> str
     return f"NOT ({joined})" if negate else f"({joined})"
 
 
+def _like_match(value: str, pattern: str) -> bool:
+    """Python twin of ``lower(value) LIKE lower(pattern)`` (``%`` any run, ``_`` one char)."""
+    rx = "".join(".*" if ch == "%" else "." if ch == "_" else re.escape(ch)
+                 for ch in pattern.lower())
+    return re.fullmatch(rx, (value or "").lower(), re.S) is not None
+
+
 @dataclass
 class Scope:
     """Resolved assessment scope (which catalogs/schemas count as production)."""
@@ -254,6 +265,13 @@ class Scope:
         if self.mode == "prod":
             return f"production ({len(self.catalogs)} catalog(s): {', '.join(self.catalogs[:8])})"
         return f"all non-system catalogs ({len(self.catalogs)})"
+
+    def contains(self, catalog: str, schema: str | None = None) -> bool:
+        """Python twin of :meth:`predicate`, for objects listed through the SDK."""
+        if catalog not in self.catalogs:
+            return False
+        return not (schema and any(_like_match(schema, p)
+                                   for p in self.exclude_schema_patterns))
 
     def catalog_predicate(self, col: str = "table_catalog") -> str:
         """SQL predicate restricting ``col`` to the in-scope catalogs."""
@@ -458,6 +476,15 @@ class Ctx:
     def complete_at(self) -> float:
         return float(self.cfg.get("complete_at", 0.80))
 
+    @property
+    def cloud(self) -> str:
+        """``aws`` / ``azure`` / ``gcp`` from ``cfg["cloud_provider"]`` - selects the
+        cloud-specific instance, GPU and spot rules in cost checks."""
+        cloud = str(self.cfg.get("cloud_provider") or "azure").strip().lower()
+        if cloud not in CLOUD_PROVIDERS:
+            raise ValueError(f"cloud_provider must be one of {CLOUD_PROVIDERS}, got {cloud!r}")
+        return cloud
+
     # -- SQL ---------------------------------------------------------------------------
 
     def sql(self, query: str) -> list[dict[str, Any]]:
@@ -605,6 +632,56 @@ class Ctx:
                 return fqn
         return system_fqn
 
+    def _attach_catalog_breakdown(self, fn: Callable[["Ctx"], Result], res: Result) -> None:
+        """Record ``metrics["by_catalog"] = {catalog: [numerator, denominator]}`` for a
+        production-scoped ratio, by re-running the same check once per in-scope catalog.
+
+        Runs in different workspaces can see different catalogs (workspace bindings), so a
+        combined report must merge catalog by catalog rather than add or pick runs. Re-using
+        the check itself keeps the per-catalog logic identical to the headline. Skipped for
+        non-ratio results, the all-catalogs fallback, and scopes over
+        ``per_catalog_max_catalogs`` (default 50). Disable with ``per_catalog_breakdown``.
+        """
+        m = res.metrics
+        if (not m.get("scoped") or "numerator" not in m or m.get("denominator") is None
+                or not self.cfg.get("per_catalog_breakdown", True)):
+            return
+        scope = self.scope
+        cats = list(scope.catalogs)
+        if scope.mode != "prod" or not cats or len(cats) > int(
+                self.cfg.get("per_catalog_max_catalogs", 50)):
+            return
+        if len(cats) == 1:
+            m["by_catalog"] = {cats[0]: [m["numerator"], m["denominator"]]}
+            return
+        by: dict[str, list] = {}
+        try:
+            for cat in cats:
+                self._scope = Scope(scope.mode, [cat], scope.include_patterns,
+                                    scope.exclude_schema_patterns, scope.system_catalogs)
+                try:
+                    sub = fn(self)
+                except Exception:  # noqa: BLE001 - breakdown is best-effort
+                    continue
+                if "numerator" in sub.metrics:
+                    by[cat] = [sub.metrics["numerator"], sub.metrics["denominator"]]
+        finally:
+            self._scope = scope
+        m["by_catalog"] = by
+
+    def visibility_note(self) -> str:
+        """Caveat naming catalogs bound only to other workspaces (``""`` if none/unknown).
+
+        Imported lazily: ``checks.inventory`` depends on this module."""
+        if not self.cfg.get("detect_hidden_catalogs", True):
+            return ""
+        try:
+            from checks import inventory  # noqa: PLC0415
+
+            return inventory.visibility_note(self)
+        except Exception:
+            return ""
+
     # -- result collection -------------------------------------------------------------
 
     def run_checks(
@@ -627,6 +704,8 @@ class Ctx:
                 if self.cfg.get("debug"):
                     traceback.print_exc()
                 res = error_result(qid, exc)
+            if fn is not None:
+                self._attach_catalog_breakdown(fn, res)
             meta = catalog_meta.get(qid, {})
             res.qid = qid
             res.pillar = pillar
@@ -635,6 +714,11 @@ class Ctx:
             # Prefix the scope caveat onto anything measured against catalog data.
             if self.scope.mode == "all" and res.metrics.get("scoped"):
                 res.reason = self.scope.note + res.reason
+            # ...and the binding caveat when catalogs are invisible from this workspace.
+            if res.metrics.get("scoped"):
+                vis = self.visibility_note()
+                if vis:
+                    res.reason = vis + res.reason
             out.append(res)
             if verbose:
                 print(f"  {STATUS_ICON.get(res.status, '[ ]')} {qid:<10} {res.status:<14} {res.title}")
@@ -778,8 +862,14 @@ def render_final_report(
     run_id: str = "",
     scope_label: str = "",
     workspace: str = "",
+    export: dict | None = None,
 ) -> str:
-    """Markdown report combining every pillar."""
+    """Markdown report combining every pillar.
+
+    ``export`` (``checks.inventory.run_export``) adds the appendices that make the report
+    self-contained for combining several workspaces' reports and building an HTML report:
+    per-workspace limits, per-catalog breakdowns, catalog visibility, and the combine /
+    HTML instructions."""
     rows = [_as_dict(r) for r in rows]
     counts = summarize(rows)
     scored = counts[STATUS_OPEN] + counts[STATUS_IN_PROGRESS] + counts[STATUS_COMPLETED]
@@ -794,6 +884,15 @@ def render_final_report(
         out.append(f"- **Workspace:** {workspace}")
     if scope_label:
         out.append(f"- **Assessment scope:** {scope_label}")
+    if export:
+        out += [
+            f"- **Workspace ID:** {export.get('workspace_id') or 'unknown'}",
+            f"- **Metastore:** {export.get('metastore') or 'unknown'}",
+            f"- **Scope mode:** {export.get('scope', {}).get('mode', '')}",
+            f"- **Activity window:** {export.get('window', '')} "
+            f"({export.get('lookback_days', '')} days)",
+            f"- **Completion threshold:** {float(export.get('complete_at', 0.8)) * 100:.0f}%",
+        ]
     out += [
         f"- **Questions assessed:** {len(rows)}",
         "",
@@ -861,7 +960,157 @@ def render_final_report(
                     f"| `{r['question_id']}` {r['question']} | {r['status']} | {reason} |"
                 )
             out.append("")
+    if export:
+        out += render_appendices(export)
     return "\n".join(out)
+
+
+def _md(v: Any) -> str:
+    return str(v).replace("|", "\\|")
+
+
+def render_appendices(export: dict) -> list[str]:
+    """Appendices A-E of the markdown report (see :func:`render_final_report`)."""
+    res = {x["question_id"]: x for x in export.get("results", [])}
+    out: list[str] = ["", "---", "", "## Appendix A - Per-workspace service limits (OE-04-01)", ""]
+    q = (res.get("OE-04-01") or {}).get("metrics") or {}
+    per_ws = q.get("per_workspace") or {}
+    out.append(
+        f"Status rule: any asset >= {q.get('open_at_pct', 80):g}% of its limit -> open; else "
+        f"average >= {q.get('complete_below_pct', 60):g}% -> in-progress; else completed. "
+        "Per-workspace limits use the fullest workspace; every workspace is listed below.")
+    for label, block in per_ws.items():
+        out += ["", f"**{label}** (limit {int(block['limit']):,} per workspace)", "",
+                "| Workspace | Count | Utilization |", "| --- | ---: | ---: |"]
+        for ws, n, pct in block.get("workspaces", []):
+            out.append(f"| {_md(ws)} | {int(n):,} | {pct:.1f}% |")
+    assets = q.get("assets") or {}
+    if assets:
+        out += ["", "**All assessed limits** (used for the status)", "",
+                "| Asset | Count | Limit | Utilization |", "| --- | ---: | ---: | ---: |"]
+        for label, a in sorted(assets.items(), key=lambda kv: -kv[1]["utilization_pct"]):
+            out.append(f"| {_md(label)} | {int(a['count']):,} | {int(a['limit']):,} "
+                       f"| {a['utilization_pct']:.1f}% |")
+
+    out += ["", "## Appendix B - Per-catalog breakdown of catalog-scoped checks", "",
+            "Production-scoped ratio checks, re-run once per in-scope catalog. A question "
+            "listed here is **catalog-scoped** (see Appendix D).", "",
+            "| Question | Catalog | Numerator | Denominator | Threshold |",
+            "| --- | --- | ---: | ---: | ---: |"]
+    for qid in sorted(res):
+        m = res[qid].get("metrics") or {}
+        for cat, (n, d) in sorted((m.get("by_catalog") or {}).items()):
+            out.append(f"| {qid} | {_md(cat)} | {int(n or 0):,} | {int(d or 0):,} "
+                       f"| {m.get('complete_at_pct', 80):g}% |")
+
+    inv = export.get("catalog_inventory") or {}
+    hidden = export.get("hidden_catalogs") or []
+    out += ["", "## Appendix C - Catalog visibility from this workspace", "",
+            f"{len(inv):,} non-system catalog(s) visible here; {len(hidden):,} bound only to "
+            "other workspaces (invisible to `information_schema` here).", "",
+            "| Catalog | Has description | Schemas | Tables | Fullest schema: tables "
+            "| Fullest schema: functions | Fullest schema: volumes | Metric views |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"]
+    for cat in sorted(inv):
+        v = inv[cat]
+        out.append("| " + " | ".join([_md(cat)] + [str(int(v.get(k) or 0)) for k in (
+            "has_comment", "schemas", "tables", "max_tables_per_schema",
+            "max_functions_per_schema", "max_volumes_per_schema", "metric_views")]) + " |")
+    if hidden:
+        out += ["", "**Bound only to other workspaces:** " + ", ".join(_md(h) for h in hidden)]
+    out += ["", COMBINE_INSTRUCTIONS, "", HTML_REPORT_INSTRUCTIONS]
+    return out
+
+
+#: Appendix D of every markdown report: how to merge several workspaces' reports.
+COMBINE_INSTRUCTIONS = """## Appendix D - Combining reports from several workspaces
+
+Run the assessment in each workspace that needs to be covered, then merge the markdown
+reports with these rules. They are deterministic: two people (or an LLM) following them
+on the same files get the same result.
+
+1. **Group the reports by metastore** (header `Metastore`, `cloud:region:id`). Only
+   combine reports from the same metastore. Most system tables are regional, so reports
+   from different regions measure different workspaces.
+2. **Pick the base report**: the most recent report whose `Scope mode` is `prod`
+   (else the most recent report). Use its question list, titles and wording.
+3. **Classify each question** and combine it accordingly:
+   - **Catalog-scoped** - the question appears in Appendix B. Take the union of catalogs
+     across all reports' Appendix B rows for that question. A catalog in several reports
+     is counted **once**, using the most recent report's row. Sum the numerators and
+     denominators over the union, then recompute: denominator 0 -> `open`; numerator 0 ->
+     `open`; share >= the row's threshold -> `completed`; otherwise `in-progress`. In the
+     base rationale, replace the first percentage, the `(n of d)` pair and the threshold
+     verdict, and change the scope label to `production (K catalog(s) across N workspace
+     run(s): ...)`.
+   - **Metastore counts** - recompute from the union of all reports' Appendix C tables
+     (a catalog in several reports counted once, most recent row wins):
+     OE-01-07 = catalogs with a description / catalogs (threshold 80%); OE-04-01
+     `Catalogs (per metastore)` = number of catalogs, `Tables (per metastore)` = sum of
+     tables, the `fullest ...` rows = the maximum. Then re-apply the OE-04-01 status rule
+     in Appendix A to the updated `All assessed limits` table.
+   - **Account-level** - every other question. System tables and the audit log already
+     cover every workspace in the region, and per-workspace objects (cluster policies,
+     Git folders, secret scopes, Apps, warehouses, jobs, identities) are counted for every
+     workspace in each run. Take the base report's status and rationale unchanged. The
+     reports should agree up to the minutes or hours between runs; a different status
+     is worth a note but not a merge.
+4. **Visibility caveat**: hidden after merge = union of all `Bound only to other
+   workspaces` lists minus the union of Appendix C catalogs. Remove any `[VISIBILITY: ...]`
+   prefix from the base rationales; if the merged hidden list is non-empty, prefix
+   catalog-scoped rationales with `[VISIBILITY: N catalog(s) are bound only to workspaces
+   that were not assessed (first five names)]`.
+5. **Score**: `completed / (questions - manual-review)` overall and per pillar.
+6. **WAF Assessment Tool JSON** (optional): one `{question_id: status}` map per pillar
+   slug, with `manual-review` written as `open` (the tool has no such state).
+7. **Record the method** in the combined report: the reports used (workspace, run id,
+   scope), the base report, and which questions were catalog-merged."""
+
+
+#: Appendix E of every markdown report: the HTML report template, account-neutral.
+HTML_REPORT_INSTRUCTIONS = """## Appendix E - Building the HTML report
+
+A single self-contained HTML file (inline CSS/JS, no external assets) named
+`waf_unified_report.html`, presented as scrollable slides. Use only names that appear in
+the reports (workspace names, catalogs); add no other organization-specific wording.
+
+**Status vocabulary** (always icon + label, never color alone): completed `#0ca30c` with a
+check mark; in-progress `#fab219` with a half circle (dark text on it); open `#d03b3b` with
+a cross; manual-review `#a9a8a0` with a question mark. Provide light and dark themes
+(`prefers-color-scheme`) and print styles (one slide per page; expand every toggle).
+
+**Slides, in order**
+1. **Sticky navigation** - Overview, How results were combined, one link per pillar,
+   Appendix, plus an "Expand all scoring logic" button.
+2. **Overview** - title `Assessment across N workspace(s)`, subtitle with cloud,
+   generation date and question count; four KPI tiles (automated maturity score with
+   `x of y scored questions`, in-progress count, open count, manual-review count); a
+   stacked status bar with counts and a legend; a pillar table: pillar (link), score,
+   a horizontal bar of the completed share, a mini stacked status bar, question count.
+   Footnote: `Score = completed / (questions - manual review)`.
+3. **How results were combined** - the workspaces assessed (name, run id, scope), the
+   three question classes from Appendix D and how each was combined, the base report,
+   a consistency note (how many statuses agree across reports), and the visibility and
+   region caveats.
+4. **One slide per pillar** - eyebrow `Pillar i of n`, pillar name, large score with
+   `x of y scored questions complete`; a stacked status bar and legend; a table with
+   columns ID, Question (title plus principle), Status (badge), Measure, and
+   `Where you are & why` (the rationale). **Measure** shows the percentage, a thin meter
+   with a tick at the threshold, and `n of d` - only when the percentage is the
+   `(n of d)` ratio in the rationale; otherwise an em dash. Tag rows `merged by catalog`
+   (Appendix B questions) or `combined across workspaces` where step 3 changed them.
+5. **"How this was scored" toggle** under every question, built from the check's source
+   (`checks/<pillar module>.py`, function named after the question id, e.g. `co_01_04`
+   for CO-01-04): one sentence on what is measured; numerator and denominator; a data
+   sources table (system table or API, the columns used, the filter); a thresholds and
+   messages table (status, condition, message template) with the row matching the
+   result highlighted; the config settings and defaults it depends on; notes; and the
+   SQL, collapsed.
+6. **Appendix** - Appendix A's per-workspace limit tables and Appendix B's per-catalog
+   breakdown, combined across reports.
+
+**Charts**: thin marks, 2px gaps between stacked segments, hover tooltips with exact
+counts, no dual axes, one hue per status."""
 
 
 def render_csv(rows: Sequence[dict]) -> str:
@@ -932,16 +1181,6 @@ def _iso_z(dt: datetime) -> str:
     """Format a datetime as the tool's ``2026-07-23T14:48:46.678Z`` (UTC, millis)."""
     dt = dt.astimezone(timezone.utc)
     return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{dt.microsecond // 1000:03d}Z"
-
-
-def cloud_from_workspace_url(url: str) -> str:
-    """Best-effort cloud provider for the ``cloudProvider`` field, from a workspace URL."""
-    u = (url or "").lower()
-    if "azuredatabricks" in u:
-        return "azure"
-    if "gcp" in u:
-        return "gcp"
-    return "aws"
 
 
 def render_waf_json(

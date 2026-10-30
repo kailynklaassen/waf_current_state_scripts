@@ -19,6 +19,8 @@ from waf_core import (
     ratio_result,
 )
 
+from checks import inventory
+
 PILLAR_ID = "performance-efficiency"
 
 
@@ -51,7 +53,7 @@ def pe_01_01(ctx: Ctx) -> Result:
                                       lower(coalesce(sku_name, '')) LIKE '%serverless%')
                         THEN usage_quantity ELSE 0 END) AS serverless
         FROM system.billing.usage
-        WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+        WHERE {inventory.billing_scope(ctx, "workspace_id")} AND usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
         """
     )
     total = float(row.get("total") or 0)
@@ -65,7 +67,8 @@ def pe_01_01(ctx: Ctx) -> Result:
         "PE-01-01",
         int(round(serverless)),
         int(round(total)),
-        f"DBUs in the last {ctx.lookback_days} days run on serverless compute, which "
+        f"DBUs in {inventory.region_label(ctx)} "
+        f"in the last {ctx.lookback_days} days run on serverless compute, which "
         "removes start-up latency and sizing guesswork",
         complete_at=ctx.complete_at,
         metrics={"serverless_dbus": round(serverless, 2), "total_dbus": round(total, 2)},
@@ -100,7 +103,7 @@ def pe_01_02(ctx: Ctx) -> Result:
                    sum(CASE WHEN upper(coalesce(billing_origin_product, '')) = 'MODEL_SERVING'
                             THEN usage_quantity ELSE 0 END) AS serving
             FROM system.billing.usage
-            WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+            WHERE {inventory.billing_scope(ctx, "workspace_id")} AND usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
               AND upper(coalesce(billing_origin_product, '')) IN
                   ('MODEL_SERVING', 'VECTOR_SEARCH', 'AI_FUNCTIONS', 'AGENT_BRICKS',
                    'AI_GATEWAY', 'SUPERVISOR_AGENT', 'AI_RUNTIME')
@@ -147,7 +150,7 @@ def pe_01_02(ctx: Ctx) -> Result:
         complete_at=ctx.complete_at,
         extra=(
             f"{requests:,} request(s) served; Model Serving is {share} of ML/GenAI DBU "
-            f"({serving_dbu:,.0f} of {genai_dbu:,.0f})."
+            f"in {inventory.region_label(ctx)} ({serving_dbu:,.0f} of {genai_dbu:,.0f})."
         ),
         metrics={"active_endpoints": active, "endpoints_with_traffic": with_traffic,
                  "requests": requests, "serving_dbu": round(serving_dbu, 2),
@@ -305,14 +308,7 @@ def pe_02_04(ctx: Ctx) -> Result:
         )
     row = ctx.one(
         f"""
-        WITH latest AS (
-          SELECT cluster_id,
-                 coalesce(max_autoscale_workers, worker_count, 0) AS workers,
-                 row_number() OVER (PARTITION BY cluster_id ORDER BY change_time DESC) AS rn
-          FROM system.compute.clusters
-          WHERE delete_time IS NULL
-            AND change_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-        )
+        {inventory.workloads_cte(ctx, 'cluster_id, coalesce(max_autoscale_workers, worker_count, 0) AS workers')}
         SELECT count(*) AS total,
                count_if(workers >= 2) AS multi_worker,
                count_if(workers = 0) AS single_node,
@@ -332,7 +328,7 @@ def pe_02_04(ctx: Ctx) -> Result:
         "PE-02-04",
         int(row.get("multi_worker") or 0),
         total,
-        "active clusters have at least two workers, so a single large cluster does the "
+        f"{inventory.workload_unit(ctx)} have at least two workers, so a single large cluster does the "
         "work instead of many undersized ones",
         complete_at=ctx.complete_at,
         extra=(
@@ -415,7 +411,7 @@ def pe_02_06(ctx: Ctx) -> Result:
                sum(CASE WHEN lower(coalesce(sku_name, '')) LIKE '%sql%'
                         THEN usage_quantity ELSE 0 END) AS sql_dbus
         FROM system.billing.usage
-        WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+        WHERE {inventory.billing_scope(ctx, "workspace_id")} AND usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
         """
     )
     total = float(row.get("total") or 0)
@@ -431,7 +427,8 @@ def pe_02_06(ctx: Ctx) -> Result:
         "PE-02-06",
         int(round(min(vectorized, total))),
         int(round(total)),
-        f"DBUs in the last {ctx.lookback_days} days run on the Photon vectorized engine "
+        f"DBUs in {inventory.region_label(ctx)} "
+        f"in the last {ctx.lookback_days} days run on the Photon vectorized engine "
         "or a Photon-backed SQL warehouse",
         complete_at=ctx.complete_at,
         extra=(
@@ -573,6 +570,7 @@ def pe_02_09(ctx: Ctx) -> Result:
                         OR lower(coalesce(operation_type, '')) LIKE '%optimize%') AS compactions
         FROM system.storage.predictive_optimization_operations_history
         WHERE start_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
+          AND {ctx.scope.predicate("catalog_name", "schema_name")}
         """
     )
     ops = int(row.get("ops") or 0)
@@ -588,16 +586,19 @@ def pe_02_09(ctx: Ctx) -> Result:
     if ops == 0 and manual_optimize == 0:
         return Result(
             "PE-02-09", "", "", "", STATUS_OPEN,
-            f"No predictive optimization operations and no manual OPTIMIZE statements in "
-            f"the last {ctx.lookback_days} days, so small files are not being compacted.",
+            f"No predictive optimization operations in {ctx.scope.label} and no manual "
+            f"OPTIMIZE statements in this region in the last {ctx.lookback_days} days, so "
+            "small files are not being compacted.",
             {"po_operations": 0, "manual_optimize": 0},
         )
     status = STATUS_COMPLETED if ops > 0 else STATUS_IN_PROGRESS
     return Result(
         "PE-02-09", "", "", "", status,
         f"Compaction is running: {ops:,} predictive optimization operation(s) across "
-        f"{int(row.get('tables') or 0)} table(s) and {manual_optimize:,} manual OPTIMIZE "
-        f"statement(s) in the last {ctx.lookback_days} days. "
+        f"{int(row.get('tables') or 0)} table(s) in {ctx.scope.label} and "
+        f"{manual_optimize:,} manual OPTIMIZE statement(s) run in this region (any "
+        f"catalog - statement text has no reliable catalog) in the last "
+        f"{ctx.lookback_days} days. "
         + (
             "Predictive Optimization handles this automatically."
             if ops
@@ -888,23 +889,25 @@ def pe_02_16(ctx: Ctx) -> Result:
             SELECT count(*) AS n
             FROM system.storage.predictive_optimization_operations_history
             WHERE start_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
+              AND {ctx.scope.predicate("catalog_name", "schema_name")}
               AND lower(coalesce(operation_type, '')) RLIKE '(analyze|statistic|compute_stats)'
             """
         )
     if analyze_stmts == 0 and po_stats == 0:
         return Result(
             "PE-02-16", "", "", "", STATUS_OPEN,
-            f"No ANALYZE TABLE statements and no statistics-collection operations in the "
-            f"last {ctx.lookback_days} days, so the optimizer may be planning without "
+            f"No statistics-collection operations in {ctx.scope.label} and no ANALYZE "
+            f"TABLE statements in this region in the last {ctx.lookback_days} days, so the "
+            "optimizer may be planning without "
             "table statistics.",
             {"analyze_statements": 0, "po_statistics_operations": 0},
         )
     status = STATUS_COMPLETED if po_stats > 0 else STATUS_IN_PROGRESS
     return Result(
         "PE-02-16", "", "", "", status,
-        f"Statistics are being collected: {analyze_stmts:,} ANALYZE TABLE statement(s) "
-        f"and {po_stats:,} automated statistics operation(s) in the last "
-        f"{ctx.lookback_days} days. "
+        f"Statistics are being collected: {po_stats:,} automated statistics operation(s) "
+        f"in {ctx.scope.label} and {analyze_stmts:,} ANALYZE TABLE statement(s) run in "
+        f"this region (any catalog) in the last {ctx.lookback_days} days. "
         + (
             "Predictive Optimization maintains statistics automatically."
             if po_stats
@@ -1080,17 +1083,15 @@ def pe_04_02(ctx: Ctx) -> Result:
     streaming = 0
     if ctx.has_table("system.lakeflow.pipelines"):
         streaming = ctx.count_safe(
-            """
-            SELECT count(*) AS n FROM system.lakeflow.pipelines
-            WHERE delete_time IS NULL AND settings.continuous = true
-            """
+            inventory.live_count_sql("pipelines", "settings", "settings.continuous = true")
         )
     updates = 0
     if ctx.has_table("system.lakeflow.pipeline_update_timeline"):
         updates = ctx.count_safe(
             f"""
-            SELECT count(*) AS n FROM system.lakeflow.pipeline_update_timeline
-            WHERE update_start_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
+            SELECT count(DISTINCT workspace_id, update_id) AS n
+            FROM system.lakeflow.pipeline_update_timeline
+            WHERE period_start_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
             """
         )
     if streaming == 0 and updates == 0:
@@ -1105,7 +1106,7 @@ def pe_04_02(ctx: Ctx) -> Result:
     return Result(
         "PE-04-02", "", "", "", status,
         f"Streaming telemetry is available: {streaming} continuous pipeline(s) and "
-        f"{updates:,} pipeline update record(s) in the last {ctx.lookback_days} days. "
+        f"{updates:,} pipeline update(s) in the last {ctx.lookback_days} days. "
         "Confirm backlog and throughput metrics are alerted on, not just recorded.",
         {"continuous_pipelines": streaming, "pipeline_updates": updates},
     )
@@ -1138,18 +1139,14 @@ def pe_04_03(ctx: Ctx) -> Result:
             "cannot be assessed.",
         )
     total_jobs = ctx.count_safe(
-        "SELECT count(DISTINCT job_id) AS n FROM system.lakeflow.jobs WHERE delete_time IS NULL"
+        inventory.live_count_sql("jobs")
     )
     with_rules = ctx.count_safe(
-        """
-        WITH latest AS (
-          SELECT job_id, health_rules,
-                 row_number() OVER (PARTITION BY job_id ORDER BY change_time DESC) AS rn
-          FROM system.lakeflow.jobs WHERE delete_time IS NULL
-        )
+        f"""
+        WITH {inventory.live_latest_cte("jobs", "job_id, health_rules")}
         SELECT count(*) AS n FROM latest
         WHERE rn = 1 AND health_rules IS NOT NULL
-          AND lower(to_json(health_rules)) NOT IN ('null', '{}', '[]')
+          AND lower(to_json(health_rules)) NOT IN ('null', '{{}}', '[]')
         """
     )
     return ratio_result(

@@ -73,6 +73,7 @@ class CliCtx(wc.Ctx):
         self.verbose = verbose
         self.queries: list[str] = []
         self.failures: list[tuple[str, str]] = []
+        self.swallowed: list[tuple[str, str]] = []
 
     def sql(self, query: str) -> list[dict]:
         one_line = " ".join(query.split())
@@ -147,16 +148,19 @@ class CliCtx(wc.Ctx):
         return ok
 
     def count_safe(self, query: str, key: str = "n", default: int = 0) -> int:
+        # In a real run a failing optional query quietly scores 0. Keep the error here
+        # as a warning: an invalid query (e.g. a bad RLIKE pattern) looks like "none found".
         try:
             return self.count(query, key)
         except Exception:
             if self.failures:
-                self.failures.pop()
+                self.swallowed.append(self.failures.pop())
             return default
 
 
-def default_cfg() -> dict:
+def default_cfg(cloud: str = "azure") -> dict:
     return {
+        "cloud_provider": cloud,
         "catalog": "main",
         "schema": "waf_assessment",
         "results_table": "waf_assessment_results",
@@ -176,13 +180,24 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--profile", required=True)
     ap.add_argument("--pillar", action="append", help="repeatable; default all")
+    ap.add_argument("--cloud", default="azure", choices=wc.CLOUD_PROVIDERS,
+                    help="CLOUD_PROVIDER for the run (default azure)")
+    ap.add_argument("--qid", action="append",
+                    help="repeatable; run only these question ids (e.g. OE-04-01)")
+    ap.add_argument("--prod-pattern", action="append",
+                    help="repeatable; PROD_CATALOG_PATTERNS for the run (default built-in)")
+    ap.add_argument("--out", help="write each check's status and rationale to this JSON file")
     ap.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
 
     import importlib
 
     targets = args.pillar or list(PILLAR_MODULES)
-    ctx = CliCtx(default_cfg(), args.profile, args.verbose)
+    only = {q.upper() for q in (args.qid or [])}
+    cfg = default_cfg(args.cloud)
+    if args.prod_pattern:
+        cfg["prod_catalog_patterns"] = args.prod_pattern
+    ctx = CliCtx(cfg, args.profile, args.verbose)
 
     print(f"Resolving scope via profile {args.profile} ...")
     t0 = time.time()
@@ -202,12 +217,15 @@ def main() -> int:
             print(f"-- {name}: module {mod_name} not written yet, skipping\n")
             continue
         pillar_name = wq.PILLAR_NAMES[pillar_id]
-        print(f"=== {pillar_name} ({len(mod.CHECKS)} checks) ===")
+        checks = [c for c in mod.CHECKS if not only or c[0] in only]
+        if not checks:
+            continue
+        print(f"=== {pillar_name} ({len(checks)} checks) ===")
         t0 = time.time()
-        res = ctx.run_checks(pillar_name, wq.pillar_meta(pillar_id), mod.CHECKS)
+        res = ctx.run_checks(pillar_name, wq.pillar_meta(pillar_id), checks)
         all_results.extend(res)
 
-        expected = set(wq.pillar_meta(pillar_id))
+        expected = {q for q in wq.pillar_meta(pillar_id) if not only or q in only}
         got = {r.qid for r in res}
         if expected - got:
             print(f"  !! MISSING checks: {sorted(expected - got)}")
@@ -231,6 +249,15 @@ def main() -> int:
         print(f"\n!! {len(ctx.failures)} SQL FAILURE(S):")
         for q, e in ctx.failures:
             print(f"\n  QUERY: {q[:300]}\n  ERROR: {e}")
+    if ctx.swallowed:
+        print(f"\n!! {len(ctx.swallowed)} OPTIONAL QUERY ERROR(S) scored as 0 (count_safe):")
+        for q, e in ctx.swallowed:
+            print(f"\n  QUERY: {q[:300]}\n  ERROR: {e[:300]}")
+    if args.out:
+        with open(args.out, "w") as fh:
+            json.dump([{"qid": r.qid, "status": r.status, "reason": r.reason,
+                        "metrics": r.metrics} for r in all_results], fh, indent=1, default=str)
+        print(f"\nResults written to {args.out}")
     print("=" * 90)
     if errors or ctx.failures:
         print(f"RESULT: FAIL ({errors} check error(s), {len(ctx.failures)} SQL failure(s))")

@@ -18,8 +18,9 @@ Privacy (38 questions) is not implemented — see [Coverage](#coverage).
 ## Quick start
 
 1. Clone this repo into a Databricks **Git folder** (Workspace → Repos → Add repo).
-2. Open `notebooks/00_config.ipynb`, set `CATALOG` and `SCHEMA`, and review
-   `PROD_CATALOG_PATTERNS`. Nothing runs until `CATALOG`/`SCHEMA` are filled in.
+2. Open `notebooks/00_config.ipynb`, set `CATALOG` and `SCHEMA`, set `CLOUD_PROVIDER`
+   (`"azure"` default, `"aws"` or `"gcp"`), and review `PROD_CATALOG_PATTERNS`. Nothing
+   runs until `CATALOG`/`SCHEMA` are filled in.
 3. Run `notebooks/99_run_all.ipynb`.
 
 That produces the combined report inline, a markdown file, a JSON export (in the WAF
@@ -117,6 +118,19 @@ DG-01-01  [manual-review]  Establish data governance process
 There are 6 such questions across the implemented pillars: `DG-01-01`, `DG-03-01`,
 `OE-01-01`, `OE-01-09`, `OE-03-03`, and `PE-03-01`.
 
+## Cloud provider
+
+Instance names, GPU families and spot settings differ per cloud, so `CLOUD_PROVIDER`
+selects the rules in `checks/cloud.py`:
+
+| Check | Azure | AWS | GCP |
+|---|---|---|---|
+| CO-01-05 GPU | `Standard_NC/ND/NG/NV*` | `g*`, `gr*`, `p*` | `a2-`, `a3-`, `g2-` |
+| CO-01-07 current generation | `_vN` suffix >= `AZURE_MIN_VM_VERSION` (5) | family prefix in `MODERN_INSTANCE_FAMILIES` | family prefix in `MODERN_INSTANCE_FAMILIES` |
+| CO-04-02 spot | `azure_attributes.availability` SPOT_AZURE / SPOT_WITH_FALLBACK_AZURE | `aws_attributes.availability` SPOT / SPOT_WITH_FALLBACK | `gcp_attributes.availability` PREEMPTIBLE* or preemptible executors |
+
+The value is also written to the JSON export's `cloudProvider` field.
+
 ## Production scope
 
 Governance matters most in production, so catalog-level questions are scored against
@@ -137,6 +151,76 @@ catalogs were assessed] 38.0% of ...
 ```
 
 `00_config` prints the resolved scope and warns when the fallback is in effect.
+
+## One run covers the account
+
+Run the assessment **once**, in any workspace of the metastore, as an **account admin**
+who is also an admin of that workspace. You do not need to run it in every workspace:
+
+- **System tables are account-wide.** Billing, query history, jobs, compute, lineage and
+  the audit log hold every workspace's data (no `workspace_id` filter is applied), so the
+  ratios already measure the whole account.
+- **Per-workspace objects are rebuilt from the audit log** (`checks/inventory.py`):
+  secret scopes, Git folders, Git credentials, custom cluster policies and Apps are counted
+  per `workspace_id` from successful create / delete / use events over
+  `INVENTORY_WINDOW_DAYS` (default 365). Deleted objects are excluded; failed calls (for
+  example a `getSecret` on a scope that does not exist, status 3002) are ignored.
+  SQL warehouses, saved jobs and pipelines come straight from `system.compute` /
+  `system.lakeflow`, and Apps are also unioned with `system.billing.usage`.
+- **Account identities** (users, service principals, groups) come from the workspace's
+  account-SCIM endpoint `/api/2.0/account/scim/v2/*` - read-only `count=1` calls.
+
+Each inventory reports **registered** vs **active** (used within `LOOKBACK_DAYS`), which
+OE-04-01 shows as an efficiency view (e.g. "secret scopes read 29/54"). Per-workspace
+limits are judged on the **fullest** workspace, which the rationale names.
+
+**Coverage check.** Objects created before the audit window and never touched since are
+invisible to the audit log. Each inventory therefore compares itself with the Workspace API
+*in the workspace the run happens in* and states the overlap in the rationale ("the audit
+log sees N of the M secret scopes the Workspace API lists"). Two API quirks are handled:
+the Repos list API does not enumerate Git folders created under `/Users` (the audit log is
+the better source), and the Git credentials API only lists the caller's own credentials.
+Built-in cluster policy families (Personal / Shared / Power User / Job / Legacy Shared
+Compute) never log a create event, so they are reported separately from custom policies.
+
+### Compute is counted per workload, not per cluster launch
+
+Every job run gets a fresh ephemeral `cluster_id` in `system.compute.clusters`, so counting
+cluster ids weights a job by how often it runs (an hourly job is ~2,160 "clusters" in 90
+days). Compute checks (CO-01-04, CO-01-07, CO-02-01/02/03, CO-04-02, IU-03-03, OE-02-02,
+PE-02-04, R-01-02, R-03-01) therefore count **workloads**: job clusters by `job_id`
+(`job-<id>-run-...`), pipeline clusters by `pipeline_id` (`dlt-execution-<id>`), and
+all-purpose clusters by `cluster_id` - each once, using its most recent configuration in
+the window. Rationales state the unit and the exact date range, e.g. *"343 of 688
+workloads (jobs, pipelines, all-purpose clusters) that ran from 2026-07-30 to 2026-10-28
+use an outdated runtime"*. CO-01-04 also reports a spend-weighted (DBU) share.
+
+### Combining runs from several workspaces
+
+Every markdown report is self-contained for combining. Its appendices hold the per-workspace
+service-limit tables (A), a **per-catalog breakdown** of each production-scoped ratio check
+(B), the catalogs visible from that workspace plus those bound elsewhere (C), and
+deterministic instructions for merging several reports (D) and building an HTML slide
+report from them (E). In short: catalog-scoped questions are merged catalog by catalog (a
+catalog seen by several workspaces counted once), metastore counts are rebuilt from the
+union of visible catalogs, and everything else is account-level and taken from the most
+recent production-scoped report. `waf_assessment_<run_id>_run.json` carries the same data
+in machine-readable form.
+
+### Limits of a single run
+
+- **Catalog bindings.** `system.information_schema` only returns catalogs bound to the
+  current workspace - *no grant (including BROWSE) changes that*. The run detects catalogs
+  bound only to other workspaces (audit log + bindings API) and prefixes catalog-scoped
+  rationales with `[VISIBILITY: N catalog(s) are bound only to other workspaces ...]`. To
+  include them, bind them **read-only** to the workspace you run from, or run there too.
+  Catalogs created before the audit window cannot be detected. Disable with
+  `DETECT_HIDDEN_CATALOGS = False`.
+- **Regions.** Most system tables (and workspace audit events) only contain workspaces in
+  the same cloud region as the metastore. Run once **per region**.
+- **hive_metastore.** `system.information_schema` does not list `hive_metastore` tables,
+  so checks that count legacy hive tables (IU-04-03, DG-01-03, OE-01-07) only see them
+  through lineage and audit references.
 
 ## Coverage
 
@@ -185,10 +269,6 @@ tools/
   gen_questions.py                regenerate waf_questions.py from the published bank
   smoke_test.py                   run every check against a real workspace, no cluster
   nbutil.py                       build and validate notebooks
-tests/
-  test_waf_core.py                scoring, scope SQL, report rendering (44 tests)
-  test_notebooks.py               notebook structure and pillar coverage (26 tests)
-  test_greenfield.py              every check on an empty/locked-down workspace (8 tests)
 ```
 
 ## Results table and combining pillars
@@ -240,14 +320,11 @@ back to the lineage system tables, so results are identical either way. The tabl
 
 ## Testing
 
-**Offline** — no workspace needed. Covers scoring thresholds, scope SQL generation
-(including quote escaping), report rendering, notebook structure, that each pillar's
-checks match the published question bank exactly, and that every check behaves on an
-empty or locked-down workspace without ever falsely reporting `completed`:
+**Offline** — no workspace needed. Validates every notebook's JSON and Python syntax and
+that no output is committed:
 
 ```bash
-python -m unittest discover -s tests -v     # 78 tests
-python tools/nbutil.py validate             # notebook JSON, syntax, no committed output
+python tools/nbutil.py validate
 ```
 
 **Against a live workspace** — executes every check's real SQL through the Databricks
@@ -278,23 +355,28 @@ grants, not missing controls.
 | `system.storage` | file sizes, predictive optimization |
 | `system.mlflow`, `system.serving` | ML tracking and model serving |
 
+Run as an **account admin** who is also a **workspace admin** of the workspace you run in:
+account admin for the account-SCIM identity counts and metastore-wide catalog bindings,
+workspace admin so the coverage check's Workspace API lists see every object.
+
 Checks degrade to `open` with an explanatory rationale when a schema is unavailable,
 rather than failing the run.
 
-**The assessment is read-only against your Databricks environment's data.** Its only writes
-are to the catalog and schema you configure: its own results table and the lineage snapshot
+**The assessment is read-only against your Databricks environment.** It never creates,
+changes or deletes existing objects - every API call it makes is a `GET` (SCIM counts,
+workspace bindings, list calls for the coverage check). Its only writes are to the catalog
+and schema you configure: its own results table and the lineage snapshot
 tables (`waf_lineage_edges`, `waf_lineage_column_edges`). With `PERSIST_RESULTS = False` it
 writes nothing at all.
 
 ## Regenerating the question bank
 
 `waf_questions.py` is generated from the WAF Assessment Tool's published JSON. If the tool
-adds or reworks questions, regenerate and the tests will flag any pillar whose checks have
-drifted:
+adds or reworks questions, regenerate it; `run_pillar()` in `00_config` then fails loudly
+for any pillar whose checks have drifted from the question bank:
 
 ```bash
 python tools/gen_questions.py
-python -m unittest discover -s tests
 ```
 
 Note: the published bank has no `PE-02-13` — it jumps `PE-02-12` → `PE-02-14`. That gap is

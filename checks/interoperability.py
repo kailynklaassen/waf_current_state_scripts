@@ -18,6 +18,8 @@ from waf_core import (
     ratio_result,
 )
 
+from checks import inventory
+
 PILLAR_ID = "interoperability-usability"
 
 
@@ -72,9 +74,10 @@ def iu_01_01(ctx: Ctx) -> Result:
     status = STATUS_COMPLETED if adhoc == 0 else STATUS_IN_PROGRESS
     return Result(
         "IU-01-01", "", "", "", status,
-        f"Governed integration objects are in place: {connections} Lakehouse Federation "
-        f"connection(s), {ext_locations} external location(s) and {credentials} storage "
-        f"credential(s). "
+        f"Governed integration objects are in place in this metastore: {connections} "
+        f"Lakehouse Federation connection(s), {ext_locations} external location(s) and "
+        f"{credentials} storage credential(s) (metastore-level objects, so not limited to "
+        "the production catalogs). "
         + (
             f"However {adhoc:,} statement(s) in the last {ctx.lookback_days} days still "
             "embed raw JDBC URLs or inline cloud keys, so the standard is not applied "
@@ -103,11 +106,9 @@ def iu_01_02(ctx: Ctx) -> Result:
     managed_ingest = 0
     if ctx.has_table("system.lakeflow.pipelines"):
         managed_ingest = ctx.count_safe(
-            """
-            SELECT count(*) AS n FROM system.lakeflow.pipelines
-            WHERE delete_time IS NULL
-              AND lower(coalesce(pipeline_type, '')) RLIKE '(ingestion|managed)'
-            """
+            inventory.live_count_sql(
+                "pipelines", "pipeline_type",
+                "lower(coalesce(pipeline_type, '')) RLIKE '(ingestion|managed)'")
         )
     federation = 0
     if ctx.has_table("system.information_schema.connections"):
@@ -125,7 +126,7 @@ def iu_01_02(ctx: Ctx) -> Result:
     if managed_ingest:
         signals.append(f"{managed_ingest} Lakeflow Connect / managed ingestion pipeline(s)")
     if federation:
-        signals.append(f"{federation} federation connection(s)")
+        signals.append(f"{federation} federation connection(s) (metastore-wide)")
     if zerobus:
         signals.append(f"{zerobus} Zerobus stream(s)")
     if not signals:
@@ -140,9 +141,9 @@ def iu_01_02(ctx: Ctx) -> Result:
     status = STATUS_COMPLETED if len(signals) >= 2 else STATUS_IN_PROGRESS
     return Result(
         "IU-01-02", "", "", "", status,
-        f"{len(signals)} optimized ingestion mechanism(s) in use: "
+        f"{len(signals)} optimized ingestion mechanism(s) in use in this region: "
         + "; ".join(signals)
-        + ".",
+        + ". Ingestion is measured per region, not per catalog.",
         {"autoloader": autoloader, "managed_ingestion": managed_ingest,
          "federation": federation, "zerobus": zerobus},
     )
@@ -256,23 +257,22 @@ def iu_01_04(ctx: Ctx) -> Result:
     pipelines = 0
     if ctx.has_table("system.lakeflow.pipelines"):
         pipelines = ctx.count_safe(
-            "SELECT count(*) AS n FROM system.lakeflow.pipelines WHERE delete_time IS NULL"
+            inventory.live_count_sql("pipelines")
         )
     jobs = 0
     complex_jobs = 0
     if ctx.has_table("system.lakeflow.jobs"):
         jobs = ctx.count_safe(
-            "SELECT count(DISTINCT job_id) AS n FROM system.lakeflow.jobs "
-            "WHERE delete_time IS NULL"
+            inventory.live_count_sql("jobs")
         )
     if ctx.has_table("system.lakeflow.job_tasks"):
         complex_jobs = ctx.count_safe(
-            """
-            WITH counts AS (
-              SELECT job_id, count(*) AS tasks
-              FROM system.lakeflow.job_tasks
-              WHERE delete_time IS NULL
-              GROUP BY job_id
+            f"""
+            WITH {inventory.live_latest_cte("job_tasks")},
+            counts AS (
+              SELECT workspace_id, job_id, count(*) AS tasks
+              FROM latest
+              GROUP BY workspace_id, job_id
             )
             SELECT count(*) AS n FROM counts WHERE tasks > 20
             """
@@ -394,8 +394,9 @@ def iu_02_02(ctx: Ctx) -> Result:
     status = STATUS_COMPLETED if shares > 0 and shared_tables > 0 else STATUS_IN_PROGRESS
     return Result(
         "IU-02-02", "", "", "", status,
-        f"Delta Sharing is configured: {shares} share(s), {recipients} recipient(s), and "
-        f"{shared_tables} shared table reference(s). "
+        f"Delta Sharing is configured in this metastore: {shares} share(s), {recipients} "
+        f"recipient(s), and {shared_tables} shared table reference(s) (shares are "
+        "metastore-level, so not limited to the production catalogs). "
         + (
             f"{ip_limited} recipient(s) are restricted by IP allowlist."
             if ip_limited
@@ -461,13 +462,7 @@ def iu_02_03(ctx: Ctx) -> Result:
 
 def iu_03_01(ctx: Ctx) -> Result:
     """Provide a self-service experience across the platform."""
-    policies = None
-    w = ctx.w
-    if w is not None:
-        try:
-            policies = sum(1 for _ in w.cluster_policies.list())
-        except Exception:
-            policies = None
+    pol = inventory.policy_evidence(ctx)
     # Self-service is visible as many distinct principals doing work themselves.
     users = 0
     if ctx.has_table("system.query.history"):
@@ -480,10 +475,11 @@ def iu_03_01(ctx: Ctx) -> Result:
     catalogs_readable = 0
     if ctx.has_table("system.information_schema.schema_privileges"):
         catalogs_readable = ctx.count_safe(
-            """
+            f"""
             SELECT count(DISTINCT grantee) AS n
             FROM system.information_schema.schema_privileges
             WHERE lower(privilege_type) IN ('select', 'use_schema', 'usage')
+              AND {ctx.scope.predicate("catalog_name", "schema_name")}
             """
         )
     if users == 0:
@@ -491,17 +487,19 @@ def iu_03_01(ctx: Ctx) -> Result:
             "IU-03-01", "", "", "", STATUS_OPEN,
             f"No query activity in the last {ctx.lookback_days} days, so self-service "
             "adoption cannot be assessed.",
-            {"active_principals": 0, "policies": policies},
+            {"active_principals": 0, **pol["metrics"]},
         )
     # Self-service has two orthogonal halves that must BOTH be present: self-provisioned
     # COMPUTE (cluster policies) and self-served DATA access (schema read grants).
-    compute_ss = bool(policies)
+    compute_ss = bool(pol["exist"])
     data_ss = catalogs_readable > 0
     signals = []
     if compute_ss:
-        signals.append(f"{policies} cluster policy/policies letting users self-provision compute safely")
+        signals.append("cluster policies let users self-provision compute safely ("
+                       + pol["text"] + ")")
     if data_ss:
-        signals.append(f"{catalogs_readable} principal(s) hold schema-level read grants")
+        signals.append(f"{catalogs_readable} principal(s) hold schema-level read grants "
+                       f"in {ctx.scope.label}")
     if compute_ss and data_ss:
         status = STATUS_COMPLETED
     elif compute_ss or data_ss:
@@ -517,7 +515,7 @@ def iu_03_01(ctx: Ctx) -> Result:
             else "No cluster policies or broad schema grants were found, so users likely "
             "depend on a central team to provision access and compute."
         ),
-        {"active_principals": users, "policies": policies,
+        {"active_principals": users, **pol["metrics"],
          "principals_with_grants": catalogs_readable},
     )
 
@@ -539,7 +537,7 @@ def iu_03_02(ctx: Ctx) -> Result:
                count(DISTINCT CASE WHEN coalesce(product_features.is_serverless, false)
                                    THEN billing_origin_product END) AS serverless_products
         FROM system.billing.usage
-        WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+        WHERE {inventory.billing_scope(ctx, "workspace_id")} AND usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
         """
     )
     total = float(row.get("total") or 0)
@@ -553,7 +551,8 @@ def iu_03_02(ctx: Ctx) -> Result:
         "IU-03-02",
         int(round(serverless)),
         int(round(total)),
-        f"DBUs in the last {ctx.lookback_days} days run on serverless services, removing "
+        f"DBUs in {inventory.region_label(ctx)} "
+        f"in the last {ctx.lookback_days} days run on serverless services, removing "
         "infrastructure setup as a barrier to new use cases",
         complete_at=ctx.complete_at,
         extra=(
@@ -567,30 +566,21 @@ def iu_03_02(ctx: Ctx) -> Result:
 
 def iu_03_03(ctx: Ctx) -> Result:
     """Use pre-defined compute templates."""
-    policies = None
-    w = ctx.w
-    if w is not None:
-        try:
-            policies = sum(1 for _ in w.cluster_policies.list())
-        except Exception:
-            policies = None
+    pol = inventory.policy_evidence(ctx)
+    # Templates = custom policies (built-in defaults exist in every workspace, so their
+    # presence says nothing about deliberate templating).
+    policies = pol["metrics"].get("custom_policies") if pol["exist"] is not None else None
     if not ctx.has_table("system.compute.clusters"):
         return presence_result(
             "IU-03-03",
             policies,
             "cluster policy/policies acting as pre-defined compute templates",
             missing_note="Without policies, users must size compute from scratch.",
-            metrics={"policies": policies},
+            metrics=dict(pol["metrics"]),
         )
     row = ctx.one(
         f"""
-        WITH latest AS (
-          SELECT cluster_id, policy_id,
-                 row_number() OVER (PARTITION BY cluster_id ORDER BY change_time DESC) AS rn
-          FROM system.compute.clusters
-          WHERE delete_time IS NULL
-            AND change_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-        )
+        {inventory.workloads_cte(ctx, 'cluster_id, policy_id')}
         SELECT count(*) AS total,
                count_if(policy_id IS NOT NULL AND policy_id <> '') AS from_template
         FROM latest WHERE rn = 1
@@ -608,20 +598,20 @@ def iu_03_03(ctx: Ctx) -> Result:
                 "so template usage could not be measured directly."
             ),
             missing_note="No policies and no clusters; compute templates are not in use.",
-            metrics={"policies": policies},
+            metrics=dict(pol["metrics"]),
         )
     return ratio_result(
         "IU-03-03",
         templated,
         total,
-        "clusters were created from a policy template rather than configured ad hoc",
+        f"{inventory.workload_unit(ctx)} use a policy template rather than an ad hoc configuration",
         complete_at=ctx.complete_at,
         extra=(
-            f"{policies} template(s) available."
-            if policies is not None
-            else "Policy inventory unavailable via the SDK."
+            f"Templates: {pol['text']}."
+            if pol["exist"] is not None
+            else "Cluster policy inventory unavailable (audit log not readable)."
         ),
-        metrics={"policies": policies, "templated_clusters": templated},
+        metrics={**pol["metrics"], "templated_clusters": templated},
     )
 
 
@@ -748,7 +738,8 @@ def iu_04_02(ctx: Ctx) -> Result:
         f"""
         WITH mv AS (
           SELECT lower(concat_ws('.', table_catalog, table_schema, table_name)) AS fqn
-          FROM system.information_schema.tables WHERE table_type = 'METRIC_VIEW'
+          FROM system.information_schema.tables
+          WHERE table_type = 'METRIC_VIEW' AND {ctx.scope.predicate()}
         ),
         lin AS (
           SELECT entity_metadata.genie_space_id AS gid,
@@ -757,6 +748,7 @@ def iu_04_02(ctx: Ctx) -> Result:
                  lower(source_table_full_name) AS src
           FROM system.access.table_lineage
           WHERE event_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+            AND {ctx.scope.predicate("source_table_catalog", "source_table_schema")}
         )
         SELECT (SELECT count(*) FROM mv) AS metric_views,
                count(DISTINCT gid) AS genie_total,
@@ -780,7 +772,8 @@ def iu_04_02(ctx: Ctx) -> Result:
     if surfaces == 0:
         return Result(
             "IU-04-02", "", "", "", STATUS_OPEN,
-            f"No Genie spaces or dashboards were observed reading any table in the last "
+            f"No Genie spaces or dashboards were observed reading any table in "
+            f"{ctx.scope.label} in the last "
             f"{ctx.lookback_days} days, so metric-view adoption cannot be measured. "
             f"{metric_views:,} metric view(s) are defined. {manual_note}",
             {"metric_views": metric_views},
@@ -789,8 +782,9 @@ def iu_04_02(ctx: Ctx) -> Result:
         "IU-04-02",
         using,
         surfaces,
-        "active Genie spaces and dashboards read from a metric view (the semantic layer "
-        "that keeps metric definitions consistent) rather than only raw tables",
+        f"active Genie spaces and dashboards reading {ctx.scope.label} read from a "
+        "metric view (the semantic layer that keeps metric definitions consistent) "
+        "rather than only raw tables",
         complete_at=ctx.complete_at,
         extra=(
             f"{metric_views:,} metric view(s) defined. Genie spaces: {gm}/{gt}; "

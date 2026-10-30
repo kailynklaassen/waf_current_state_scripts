@@ -16,6 +16,8 @@ from waf_core import (
     ratio_result,
 )
 
+from checks import inventory
+
 PILLAR_ID = "reliability"
 
 #: Default medallion layer name patterns (RLIKE substrings, incl. common abbreviations).
@@ -94,13 +96,7 @@ def r_01_02(ctx: Ctx) -> Result:
         )
     row = ctx.one(
         f"""
-        WITH latest AS (
-          SELECT cluster_id, dbr_version,
-                 row_number() OVER (PARTITION BY cluster_id ORDER BY change_time DESC) AS rn
-          FROM system.compute.clusters
-          WHERE delete_time IS NULL
-            AND change_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-        )
+        {inventory.workloads_cte(ctx, 'cluster_id, dbr_version')}
         SELECT count(*) AS total,
                count_if(dbr_version IS NOT NULL AND dbr_version <> '') AS known
         FROM latest WHERE rn = 1
@@ -112,9 +108,9 @@ def r_01_02(ctx: Ctx) -> Result:
     if ctx.has_table("system.billing.usage"):
         serverless_jobs = ctx.count(
             f"""
-            SELECT count(DISTINCT usage_metadata.job_id) AS n
+            SELECT count(DISTINCT workspace_id, usage_metadata.job_id) AS n
             FROM system.billing.usage
-            WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+            WHERE {inventory.billing_scope(ctx, "workspace_id")} AND usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
               AND coalesce(product_features.is_serverless, lower(coalesce(sku_name, '')) LIKE '%serverless%')
               AND usage_metadata.job_id IS NOT NULL
             """
@@ -128,8 +124,10 @@ def r_01_02(ctx: Ctx) -> Result:
         )
     return Result(
         "R-01-02", "", "", "", STATUS_COMPLETED,
-        f"Workloads run on managed Spark: {total} active cluster(s) and "
-        f"{serverless_jobs} job(s) on serverless compute in the last "
+        f"Workloads run on managed Spark: {total} classic compute workload(s) "
+        f"(jobs, pipelines, all-purpose clusters) that ran {inventory.window_text(ctx)} and "
+        f"{serverless_jobs:,} job(s) on serverless compute in {inventory.region_label(ctx)} "
+        f"in the last "
         f"{ctx.lookback_days} days. Databricks Runtime provides distributed "
         "fault tolerance (task retries, speculative execution) by default.",
         {"clusters": total, "serverless_jobs": serverless_jobs},
@@ -183,6 +181,34 @@ def r_01_03(ctx: Ctx) -> Result:
     )
 
 
+def _task_retries(ctx: Ctx) -> dict[str, int]:
+    """Retries and repairs in the lookback window, from task runs: a task attempted more
+    than once within the same job run (each attempt gets its own ``run_id``). The
+    ``run_type`` column cannot show this - its only values are JOB_RUN, WORKFLOW_RUN
+    and SUBMIT_RUN."""
+    if not ctx.has_table("system.lakeflow.job_task_run_timeline"):
+        return {"tasks": 0, "runs": 0, "jobs": 0}
+    return inventory._memo(ctx, "task_retries", lambda: _task_retry_counts(ctx))
+
+
+def _task_retry_counts(ctx: Ctx) -> dict[str, int]:
+    row = ctx.one(
+        f"""
+        WITH attempts AS (
+          SELECT workspace_id, job_id, job_run_id, task_key, count(DISTINCT run_id) AS n
+          FROM system.lakeflow.job_task_run_timeline
+          WHERE period_start_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
+          GROUP BY ALL
+        )
+        SELECT count_if(n > 1) AS tasks,
+               count(DISTINCT CASE WHEN n > 1 THEN concat(workspace_id, ':', job_run_id) END) AS runs,
+               count(DISTINCT CASE WHEN n > 1 THEN concat(workspace_id, ':', job_id) END) AS jobs
+        FROM attempts
+        """
+    )
+    return {k: int(row.get(k) or 0) for k in ("tasks", "runs", "jobs")}
+
+
 def r_01_04(ctx: Ctx) -> Result:
     """Configure jobs for automatic retries and termination."""
     if not ctx.has_table("system.lakeflow.jobs"):
@@ -192,10 +218,7 @@ def r_01_04(ctx: Ctx) -> Result:
             "be assessed.",
         )
     total = ctx.count(
-        """
-        SELECT count(DISTINCT job_id) AS n FROM system.lakeflow.jobs
-        WHERE delete_time IS NULL
-        """
+        inventory.live_count_sql("jobs")
     )
     if total == 0:
         return Result(
@@ -203,26 +226,14 @@ def r_01_04(ctx: Ctx) -> Result:
             "No active jobs found, so retry and timeout configuration cannot be verified.",
         )
     with_timeout = ctx.count(
-        """
-        WITH latest AS (
-          SELECT job_id, timeout_seconds,
-                 row_number() OVER (PARTITION BY job_id ORDER BY change_time DESC) AS rn
-          FROM system.lakeflow.jobs WHERE delete_time IS NULL
-        )
+        f"""
+        WITH {inventory.live_latest_cte("jobs", "job_id, timeout_seconds")}
         SELECT count(*) AS n FROM latest
         WHERE rn = 1 AND timeout_seconds IS NOT NULL AND timeout_seconds > 0
         """
     )
-    # Retries are observable from run history: a repaired/retried run reuses job_run_id.
-    retried = 0
-    if ctx.has_table("system.lakeflow.job_run_timeline"):
-        retried = ctx.count(
-            f"""
-            SELECT count(DISTINCT job_id) AS n FROM system.lakeflow.job_run_timeline
-            WHERE period_start_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-              AND lower(coalesce(run_type, '')) LIKE '%retry%'
-            """
-        )
+    retries = _task_retries(ctx)
+    retried = retries["jobs"]
     res = ratio_result(
         "R-01-04",
         with_timeout,
@@ -230,7 +241,8 @@ def r_01_04(ctx: Ctx) -> Result:
         "active jobs declare a timeout so a hung run cannot run indefinitely",
         complete_at=ctx.complete_at,
         extra=(
-            f"{retried} job(s) show retry activity in the last {ctx.lookback_days} days."
+            f"{retried:,} job(s) show retry activity in the last {ctx.lookback_days} days "
+            f"({retries['tasks']:,} task(s) re-attempted across {retries['runs']:,} run(s))."
             if retried
             else "No retry activity observed in the lookback window; confirm max_retries "
             "is set on tasks."
@@ -297,7 +309,7 @@ def r_01_06(ctx: Ctx) -> Result:
           sum(CASE WHEN coalesce(product_features.is_serverless, lower(coalesce(sku_name, '')) LIKE '%serverless%')
                    THEN usage_quantity ELSE 0 END) AS serverless
         FROM system.billing.usage
-        WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+        WHERE {inventory.billing_scope(ctx, "workspace_id")} AND usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
         """
     )
     total = float(row.get("total") or 0)
@@ -311,7 +323,8 @@ def r_01_06(ctx: Ctx) -> Result:
         "R-01-06",
         int(round(serverless)),
         int(round(total)),
-        f"DBU consumption in the last {ctx.lookback_days} days is on serverless / "
+        f"DBU consumption in {inventory.region_label(ctx)} "
+        f"in the last {ctx.lookback_days} days is on serverless / "
         "managed compute",
         complete_at=ctx.complete_at,
         extra="Managed compute removes cluster tuning and patching as a failure source.",
@@ -496,7 +509,7 @@ def r_02_04(ctx: Ctx) -> Result:
     pipelines = 0
     if ctx.has_table("system.lakeflow.pipelines"):
         pipelines = ctx.count_safe(
-            "SELECT count(*) AS n FROM system.lakeflow.pipelines WHERE delete_time IS NULL"
+            inventory.live_count_sql("pipelines")
         )
     mix = ", ".join(f"{r['constraint_type']}={r['n']}" for r in kinds)
     return ratio_result(
@@ -574,12 +587,14 @@ def r_02_05(ctx: Ctx) -> Result:
         WITH edges AS (SELECT * FROM {lt}), {pairs_sql}
         ml_tables AS (
           SELECT DISTINCT full_name FROM (
-            SELECT source_table_full_name AS full_name,
+            SELECT source_table_full_name AS full_name, source_table_catalog AS cat,
                    source_table_schema AS sch, source_table_name AS nm FROM edges
             UNION ALL
-            SELECT target_table_full_name, target_table_schema, target_table_name FROM edges
+            SELECT target_table_full_name, target_table_catalog, target_table_schema,
+                   target_table_name FROM edges
           )
           WHERE full_name IS NOT NULL
+            AND {ctx.scope.predicate("cat", "sch")}
             AND lower(concat_ws('.', coalesce(sch, ''), coalesce(nm, ''))) RLIKE '{ml_pattern}'
         ),
         deep AS ({deep_sql})
@@ -596,16 +611,17 @@ def r_02_05(ctx: Ctx) -> Result:
         "R-02-05",
         num,
         denom,
-        f"ML tables (feature/training/scoring, by naming) have at least {min_hops} {hop_word} "
-        "of upstream lineage (built through a multi-step pipeline) rather than having raw "
-        "data fed straight into models",
+        f"ML tables (feature/training/scoring, by naming) in {ctx.scope.label} have at "
+        f"least {min_hops} {hop_word} of upstream lineage (built through a multi-step "
+        "pipeline, from any catalog) rather than having raw data fed straight into models",
         complete_at=ctx.complete_at,
         none_found=(
-            "No ML-related tables (feature/training/scoring, by naming) appear in lineage, "
-            "so a data-centric ML practice is not in evidence. Mark ignore in the WAF tool "
-            "if ML is out of scope."
+            f"No ML-related tables (feature/training/scoring, by naming) in "
+            f"{ctx.scope.label} appear in lineage, so a data-centric ML practice is not in "
+            "evidence. Mark ignore in the WAF tool if ML is out of scope."
         ),
-        extra=f"{runs:,} MLflow run(s) tracked in the last {ctx.lookback_days} days.",
+        extra=(f"{runs:,} MLflow run(s) tracked in this region in the last "
+               f"{ctx.lookback_days} days."),
         metrics={"mlflow_runs": runs, "ml_tables_in_lineage": denom,
                  "ml_tables_with_min_hops": num, "min_upstream_hops": min_hops},
     )
@@ -626,13 +642,7 @@ def r_03_01(ctx: Ctx) -> Result:
         )
     row = ctx.one(
         f"""
-        WITH latest AS (
-          SELECT cluster_id, min_autoscale_workers, max_autoscale_workers, worker_count,
-                 row_number() OVER (PARTITION BY cluster_id ORDER BY change_time DESC) AS rn
-          FROM system.compute.clusters
-          WHERE delete_time IS NULL
-            AND change_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-        )
+        {inventory.workloads_cte(ctx, 'cluster_id, min_autoscale_workers, max_autoscale_workers, worker_count')}
         SELECT count(*) AS total,
                count_if(max_autoscale_workers IS NOT NULL
                         AND max_autoscale_workers > coalesce(min_autoscale_workers, 0)) AS autoscaling
@@ -645,9 +655,9 @@ def r_03_01(ctx: Ctx) -> Result:
     if ctx.has_table("system.billing.usage"):
         serverless_jobs = ctx.count(
             f"""
-            SELECT count(DISTINCT usage_metadata.job_id) AS n
+            SELECT count(DISTINCT workspace_id, usage_metadata.job_id) AS n
             FROM system.billing.usage
-            WHERE usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
+            WHERE {inventory.billing_scope(ctx, "workspace_id")} AND usage_date >= current_date() - INTERVAL {ctx.lookback_days} DAYS
               AND coalesce(product_features.is_serverless, lower(coalesce(sku_name, '')) LIKE '%serverless%')
               AND usage_metadata.job_id IS NOT NULL
             """
@@ -669,10 +679,11 @@ def r_03_01(ctx: Ctx) -> Result:
         "R-03-01",
         autoscaling,
         total,
-        "active clusters have autoscaling enabled",
+        f"{inventory.workload_unit(ctx)} have autoscaling enabled",
         complete_at=ctx.complete_at,
         extra=(
-            f"{serverless_jobs} job(s) additionally run on serverless compute, which "
+            f"{serverless_jobs:,} job(s) in {inventory.region_label(ctx)} "
+            f"additionally run on serverless compute, which "
             "autoscales by design."
             if serverless_jobs
             else "Fixed-size clusters cannot absorb load spikes."
@@ -692,13 +703,13 @@ def r_03_02(ctx: Ctx) -> Result:
     row = ctx.one(
         """
         WITH latest AS (
-          SELECT warehouse_id, min_clusters, max_clusters,
+          SELECT warehouse_id, delete_time, min_clusters, max_clusters,
                  row_number() OVER (PARTITION BY warehouse_id ORDER BY change_time DESC) AS rn
-          FROM system.compute.warehouses WHERE delete_time IS NULL
+          FROM system.compute.warehouses
         )
         SELECT count(*) AS total,
                count_if(max_clusters > coalesce(min_clusters, 1)) AS scaling
-        FROM latest WHERE rn = 1
+        FROM latest WHERE rn = 1 AND delete_time IS NULL
         """
     )
     total = int(row.get("total") or 0)
@@ -729,10 +740,7 @@ def r_04_01(ctx: Ctx) -> Result:
     streaming_pipelines = 0
     if ctx.has_table("system.lakeflow.pipelines"):
         streaming_pipelines = ctx.count_safe(
-            """
-            SELECT count(*) AS n FROM system.lakeflow.pipelines
-            WHERE delete_time IS NULL AND settings.continuous = true
-            """
+            inventory.live_count_sql("pipelines", "settings", "settings.continuous = true")
         )
     streaming_queries = 0
     if ctx.has_table("system.query.history"):
@@ -853,7 +861,7 @@ def r_04_03(ctx: Ctx) -> Result:
             "assessed.",
         )
     total = ctx.count(
-        "SELECT count(DISTINCT job_id) AS n FROM system.lakeflow.jobs WHERE delete_time IS NULL"
+        inventory.live_count_sql("jobs")
     )
     if total == 0:
         return Result(
@@ -863,21 +871,13 @@ def r_04_03(ctx: Ctx) -> Result:
     dependent = 0
     if ctx.has_table("system.lakeflow.job_tasks"):
         dependent = ctx.count(
-            """
-            SELECT count(DISTINCT job_id) AS n FROM system.lakeflow.job_tasks
-            WHERE delete_time IS NULL
-              AND depends_on_keys IS NOT NULL AND size(depends_on_keys) > 0
-            """
-        )
-    repairs = 0
-    if ctx.has_table("system.lakeflow.job_run_timeline"):
-        repairs = ctx.count(
             f"""
-            SELECT count(*) AS n FROM system.lakeflow.job_run_timeline
-            WHERE period_start_time >= current_timestamp() - INTERVAL {ctx.lookback_days} DAYS
-              AND lower(coalesce(run_type, '')) RLIKE '(repair|retry)'
+            WITH {inventory.live_latest_cte("job_tasks", "depends_on_keys")}
+            SELECT count(DISTINCT workspace_id, job_id) AS n FROM latest
+            WHERE depends_on_keys IS NOT NULL AND size(depends_on_keys) > 0
             """
         )
+    repairs = _task_retries(ctx)["runs"]
     return ratio_result(
         "R-04-03",
         dependent,
@@ -886,8 +886,8 @@ def r_04_03(ctx: Ctx) -> Result:
         "task-level retry and repair-run recovery)",
         complete_at=ctx.complete_at,
         extra=(
-            f"{repairs:,} repair/retry run(s) in the last {ctx.lookback_days} days show "
-            "recovery is exercised."
+            f"{repairs:,} job run(s) in the last {ctx.lookback_days} days re-attempted a "
+            "task (retry or repair), so recovery is exercised."
             if repairs
             else "No repair or retry runs observed in the lookback window."
         ),
@@ -906,11 +906,7 @@ def r_04_04(ctx: Ctx) -> Result:
     shares = 0
     if ctx.has_table("system.information_schema.shares"):
         shares = ctx.count("SELECT count(*) AS n FROM system.information_schema.shares")
-    workspaces = 0
-    if ctx.has_table("system.access.workspaces_latest"):
-        workspaces = ctx.count(
-            "SELECT count(DISTINCT workspace_id) AS n FROM system.access.workspaces_latest"
-        )
+    workspaces = inventory.region_workspace_count(ctx) or 0
     deep_clones = 0
     if ctx.has_table("system.storage.table_metrics_history"):
         deep_clones = ctx.count(
@@ -934,7 +930,9 @@ def r_04_04(ctx: Ctx) -> Result:
         "R-04-04", "", "", "", STATUS_OPEN if replication == 0 else STATUS_COMPLETED,
         f"DR signals found: {replication} replication state record(s), {deep_clones} "
         f"cloned table(s) in the last 30 days, {shares} Delta Share(s), across "
-        f"{workspaces} workspace(s). Verify the documented RTO/RPO and last failover test.",
+        f"{workspaces} workspace(s) in this region (DR is a metastore-level pattern, so "
+        "not limited to the production catalogs). Verify the documented RTO/RPO and "
+        "last failover test.",
         {"replication_states": replication, "clones": deep_clones,
          "shares": shares, "workspaces": workspaces},
     )
@@ -970,15 +968,11 @@ def r_05_01(ctx: Ctx) -> Result:
     alerting = 0
     if ctx.has_table("system.lakeflow.jobs"):
         alerting = ctx.count(
-            """
-            WITH latest AS (
-              SELECT job_id, health_rules,
-                     row_number() OVER (PARTITION BY job_id ORDER BY change_time DESC) AS rn
-              FROM system.lakeflow.jobs WHERE delete_time IS NULL
-            )
+            f"""
+            WITH {inventory.live_latest_cte("jobs", "job_id, health_rules")}
             SELECT count(*) AS n FROM latest
             WHERE rn = 1 AND health_rules IS NOT NULL
-              AND lower(to_json(health_rules)) NOT IN ('null', '{}', '[]')
+              AND lower(to_json(health_rules)) NOT IN ('null', '{{}}', '[]')
             """
         )
     if runs == 0:
@@ -989,7 +983,7 @@ def r_05_01(ctx: Ctx) -> Result:
         )
     success_rate = ok / runs * 100
     total_jobs = ctx.count(
-        "SELECT count(DISTINCT job_id) AS n FROM system.lakeflow.jobs WHERE delete_time IS NULL"
+        inventory.live_count_sql("jobs")
     )
     res = ratio_result(
         "R-05-01",
