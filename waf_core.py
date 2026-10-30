@@ -51,6 +51,22 @@ STATUS_ICON = {
     STATUS_MANUAL: "[?]",
 }
 
+#: Why a table could not be read: the runner lacks a grant, or it does not exist here
+#: (a system schema not enabled, or a feature not in use - Databricks reports both as
+#: TABLE_OR_VIEW_NOT_FOUND).
+ACCESS_DENIED = "denied"
+ACCESS_MISSING = "missing"
+
+
+def classify_table_error(message: str) -> str:
+    """:data:`ACCESS_DENIED` for permission errors, else :data:`ACCESS_MISSING`."""
+    m = (message or "").upper()
+    if any(t in m for t in ("INSUFFICIENT_PERMISSIONS", "PERMISSION_DENIED",
+                            "DOES NOT HAVE", "NOT AUTHORIZED", "ACCESS DENIED")):
+        return ACCESS_DENIED
+    return ACCESS_MISSING
+
+
 #: Values accepted for ``cfg["cloud_provider"]`` (``CLOUD_PROVIDER`` in 00_config).
 CLOUD_PROVIDERS = ("azure", "aws", "gcp")
 
@@ -434,6 +450,11 @@ class Ctx:
         self._w = w
         self._scope: Scope | None = None
         self._table_cache: dict[str, bool] = {}
+        # fqn -> ACCESS_DENIED / ACCESS_MISSING for every table that could not be read,
+        # plus the subset probed by the check currently running (see run_checks).
+        self.unreadable: dict[str, str] = {}
+        self._check_unreadable: dict[str, str] = {}
+        self._runner: str | None = None
         self._lineage_tbl: str | None = None
         self._lineage_col_tbl: str | None = None
         self._lineage_closure: str | None = None
@@ -502,17 +523,29 @@ class Ctx:
         return int(val) if val is not None else 0
 
     def has_table(self, fqn: str) -> bool:
-        """Whether a (system) table exists and is readable. Cached."""
-        if fqn in self._table_cache:
-            return self._table_cache[fqn]
-        ok = False
-        try:
-            self.spark.sql(f"SELECT 1 FROM {fqn} LIMIT 1").collect()
-            ok = True
-        except Exception:
+        """Whether a (system) table exists and is readable. Cached; failures are recorded
+        with their cause so results can say which grant is missing."""
+        if fqn not in self._table_cache:
             ok = False
-        self._table_cache[fqn] = ok
-        return ok
+            try:
+                self.spark.sql(f"SELECT 1 FROM {fqn} LIMIT 1").collect()
+                ok = True
+            except Exception as exc:  # noqa: BLE001
+                self.unreadable[fqn] = classify_table_error(str(exc))
+            self._table_cache[fqn] = ok
+        if not self._table_cache[fqn] and fqn in self.unreadable:
+            self._check_unreadable[fqn] = self.unreadable[fqn]
+        return self._table_cache[fqn]
+
+    @property
+    def runner(self) -> str:
+        """The principal running the assessment (``current_user()``)."""
+        if self._runner is None:
+            try:
+                self._runner = str(self.one("SELECT current_user() AS u").get("u") or "")
+            except Exception:  # noqa: BLE001
+                self._runner = ""
+        return self._runner or "the runner"
 
     def require_tables(self, *fqns: str) -> str | None:
         """Return a human-readable note naming the first unavailable table, else None."""
@@ -682,6 +715,49 @@ class Ctx:
         except Exception:
             return ""
 
+    def access_note(self, unreadable: dict[str, str]) -> str:
+        """``[ACCESS: ...]`` caveat naming each unreadable table and how to fix it."""
+        if not unreadable:
+            return ""
+        parts = []
+        for fqn, kind in sorted(unreadable.items()):
+            if kind == ACCESS_DENIED:
+                schema = fqn.rsplit(".", 1)[0]
+                parts.append(f"{fqn} - {self.runner} lacks the grant (GRANT USE CATALOG ON "
+                             f"CATALOG {schema.split('.')[0]}, USE SCHEMA and SELECT ON SCHEMA "
+                             f"{schema} TO `{self.runner}`)")
+            else:
+                parts.append(f"{fqn} - not found (system schema not enabled, or the "
+                             "feature is not in use here)")
+        return "[ACCESS: could not read " + "; ".join(parts) + "] "
+
+    def _apply_access_gaps(self, res: Result, unreadable: dict[str, str]) -> None:
+        """An unreadable table means the result may describe the runner's access rather
+        than the environment. If the check could not read its own source (it returned
+        "not readable"), or a permission gap left it at ``open``, mark it manual-review;
+        either way name the gap. A table that simply does not exist only adds the note."""
+        if not unreadable:
+            return
+        denied = any(k == ACCESS_DENIED for k in unreadable.values())
+        own_source = res.status == STATUS_OPEN and "not readable" in res.reason
+        if res.status == STATUS_OPEN and (denied or own_source):
+            res.status = STATUS_MANUAL
+            res.metrics["access_gap"] = True
+        res.metrics["unreadable_tables"] = unreadable
+        res.reason = self.access_note(unreadable) + res.reason
+
+    def access_scope_note(self) -> str:
+        """Caveat naming in-scope catalogs the runner has no privileges on (``""`` if
+        none/unknown). Imported lazily: ``checks.inventory`` depends on this module."""
+        if not self.cfg.get("detect_hidden_catalogs", True):
+            return ""
+        try:
+            from checks import inventory  # noqa: PLC0415
+
+            return inventory.access_scope_note(self)
+        except Exception:
+            return ""
+
     # -- result collection -------------------------------------------------------------
 
     def run_checks(
@@ -698,12 +774,14 @@ class Ctx:
         """
         out: list[Result] = []
         for qid, fn in checks:
+            self._check_unreadable = {}
             try:
                 res = fn(self) if fn else error_result(qid, RuntimeError("no check defined"))
             except Exception as exc:  # noqa: BLE001 - one bad check must not stop the pillar
                 if self.cfg.get("debug"):
                     traceback.print_exc()
                 res = error_result(qid, exc)
+            self._apply_access_gaps(res, dict(self._check_unreadable))
             if fn is not None:
                 self._attach_catalog_breakdown(fn, res)
             meta = catalog_meta.get(qid, {})
@@ -719,6 +797,15 @@ class Ctx:
                 vis = self.visibility_note()
                 if vis:
                     res.reason = vis + res.reason
+                # In-scope catalogs hidden by the runner's privileges: the ratio covers
+                # only part of the scope, so it cannot be trusted as the scored status.
+                gap = self.access_scope_note()
+                if gap:
+                    if res.status != STATUS_MANUAL:
+                        res.metrics["status_before_access_gap"] = res.status
+                        res.status = STATUS_MANUAL
+                    res.metrics["access_gap"] = True
+                    res.reason = gap + res.reason
             out.append(res)
             if verbose:
                 print(f"  {STATUS_ICON.get(res.status, '[ ]')} {qid:<10} {res.status:<14} {res.title}")
@@ -1018,6 +1105,16 @@ def render_appendices(export: dict) -> list[str]:
             "max_functions_per_schema", "max_volumes_per_schema", "metric_views")]) + " |")
     if hidden:
         out += ["", "**Bound only to other workspaces:** " + ", ".join(_md(h) for h in hidden)]
+    priv = export.get("privilege_hidden_catalogs") or []
+    if priv:
+        out += ["", f"**In scope but not visible to {_md(str(export.get('runner') or 'the runner'))} "
+                f"(no privileges; catalog-scoped results marked manual-review):** "
+                + ", ".join(_md(h) for h in priv)]
+    unread = export.get("unreadable_tables") or {}
+    if unread:
+        out += ["", "**System tables the runner could not read:** " + ", ".join(
+            f"{_md(t)} ({'missing grant' if k == ACCESS_DENIED else 'not found'})"
+            for t, k in unread.items())]
     out += ["", COMBINE_INSTRUCTIONS, "", HTML_REPORT_INSTRUCTIONS]
     return out
 

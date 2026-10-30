@@ -585,19 +585,26 @@ def lifecycle_evidence(ctx: Ctx, kind: str) -> dict[str, Any]:
 MAX_BINDING_LOOKUPS = 200
 
 
-def hidden_catalogs(ctx: Ctx) -> list[str] | None:
-    """Catalogs in this metastore that ``system.information_schema`` cannot see from the
-    current workspace because they are bound only to other workspaces.
+def _invisible_catalogs(ctx: Ctx) -> dict[str, str] | None:
+    """Catalogs in this metastore that ``system.information_schema`` does not show the
+    runner, each classified as ``"binding"`` (bound only to other workspaces) or
+    ``"privilege"`` (open to, or bound to, this workspace - or bindings unreadable - but
+    the runner has no privileges on it).
 
-    Candidates are catalogs created (and not since deleted) in this metastore during the
-    audit window that do not appear in ``information_schema.catalogs``; each is confirmed
-    with the workspace-bindings API, which answers even from an unbound workspace. Catalogs
-    created before the audit window cannot be discovered this way. ``None`` = unknown.
+    Candidates come from sources not filtered by the runner's privileges: catalogs created
+    (and not since deleted) in this metastore during the audit window, plus catalogs with
+    predictive-optimization activity in this metastore. Each is checked with the
+    workspace-bindings API, which answers even from an unbound workspace. Catalogs that
+    appear in neither source cannot be discovered. ``None`` = unknown.
     """
     def build():
         ws, w = current_workspace_id(ctx), ctx.w
         if ws is None or w is None or not ctx.has_table(AUDIT):
             return None
+        po = "system.storage.predictive_optimization_operations_history"
+        po_sql = (f"UNION SELECT DISTINCT catalog_name FROM {po} "
+                  "WHERE metastore_id = element_at(split(current_metastore(), ':'), -1)"
+                  if ctx.has_table(po) else "")
         try:
             rows = ctx.sql(f"""
                 WITH ev AS (
@@ -615,15 +622,21 @@ def hidden_catalogs(ctx: Ctx) -> list[str] | None:
                          max(CASE WHEN action_name = 'createCatalog' THEN event_time END) AS c,
                          max(CASE WHEN action_name = 'deleteCatalog' THEN event_time END) AS d
                   FROM ev WHERE name IS NOT NULL GROUP BY name
+                ),
+                known AS (
+                  SELECT name FROM life WHERE c IS NOT NULL AND (d IS NULL OR c > d)
+                  {po_sql}
                 )
-                SELECT l.name FROM life l
-                LEFT ANTI JOIN system.information_schema.catalogs v ON v.catalog_name = l.name
-                WHERE l.c IS NOT NULL AND (l.d IS NULL OR l.c > l.d)
-                ORDER BY l.name
+                SELECT k.name FROM known k
+                LEFT ANTI JOIN system.information_schema.catalogs v ON v.catalog_name = k.name
+                WHERE k.name IS NOT NULL
+                  AND k.name NOT IN ('system', 'samples', 'hive_metastore')
+                  AND k.name NOT LIKE '__databricks_internal%'
+                ORDER BY k.name
             """)
         except Exception:
             return None
-        hidden = []
+        out: dict[str, str] = {}
         for r in rows[:MAX_BINDING_LOOKUPS]:
             name = r.get("name")
             try:
@@ -632,11 +645,44 @@ def hidden_catalogs(ctx: Ctx) -> list[str] | None:
                 items = b.bindings if hasattr(b, "bindings") else b
                 bound = {int(x.workspace_id) for x in (items or [])}
             except Exception:
-                continue  # no access to the binding either -> cannot confirm
-            if bound and ws not in bound:
-                hidden.append(name)
-        return hidden
-    return _memo(ctx, "hidden_catalogs", build)
+                bound = set()  # bindings unreadable: the runner lacks access to it
+            out[name] = "binding" if bound and ws not in bound else "privilege"
+        return out
+    return _memo(ctx, "invisible_catalogs", build)
+
+
+def hidden_catalogs(ctx: Ctx) -> list[str] | None:
+    """Catalogs bound only to other workspaces (``None`` = unknown)."""
+    inv = _invisible_catalogs(ctx)
+    return None if inv is None else sorted(n for n, k in inv.items() if k == "binding")
+
+
+def privilege_hidden_catalogs(ctx: Ctx) -> list[str] | None:
+    """In-scope-pattern catalogs this workspace could see but the runner has no privileges
+    on: they match ``PROD_CATALOG_PATTERNS`` (any non-system catalog when the scope fell
+    back to all catalogs), so catalog-scoped results silently leave them out."""
+    inv = _invisible_catalogs(ctx)
+    if inv is None:
+        return None
+    scope = ctx.scope
+    names = sorted(n for n, k in inv.items() if k == "privilege")
+    if scope.mode == "prod":
+        from waf_core import _like_match  # noqa: PLC0415
+        names = [n for n in names if any(_like_match(n, p) for p in scope.include_patterns)]
+    return names
+
+
+def access_scope_note(ctx: Ctx) -> str:
+    """``[ACCESS]`` caveat for catalog-scoped results when in-scope catalogs are hidden
+    from the runner by privileges (``""`` if none or unknown)."""
+    hidden = privilege_hidden_catalogs(ctx) or []
+    if not hidden:
+        return ""
+    shown = ", ".join(hidden[:5]) + (", ..." if len(hidden) > 5 else "")
+    return (f"[ACCESS: {len(hidden)} catalog(s) in the configured scope exist in this "
+            f"metastore but {ctx.runner} has no privileges on them ({shown}), so this result "
+            "leaves them out; grant BROWSE (or USE CATALOG, USE SCHEMA and SELECT) on them, "
+            "or run as a metastore admin] ")
 
 
 def visibility_note(ctx: Ctx) -> str:
@@ -881,8 +927,69 @@ def run_export(ctx: Ctx, results: list, workspace_url: str = "") -> dict[str, An
         "window": window_text(ctx),
         "scope": {"mode": scope.mode, "label": scope.label, "catalogs": scope.catalogs},
         "hidden_catalogs": hidden_catalogs(ctx) or [],
+        "runner": ctx.runner,
+        "privilege_hidden_catalogs": privilege_hidden_catalogs(ctx) or [],
+        "unreadable_tables": dict(sorted(ctx.unreadable.items())),
         "catalog_inventory": catalog_inventory(ctx),
         "results": [{"pillar": r.pillar, "question_id": r.qid, "principle": r.principle,
                      "question": r.title, "status": r.status, "reason": r.reason,
                      "metrics": r.metrics} for r in results],
     }
+
+
+def access_report(ctx: Ctx, tables: list[tuple[str, str]]) -> list[str]:
+    """Pre-flight lines for 00_config: who is running, which roles they hold, which system
+    tables they can read, the GRANTs that are missing, and in-scope catalogs hidden from
+    them. Being a workspace admin alone grants none of the system tables."""
+    lines = [f"Running as        : {ctx.runner}"]
+    try:
+        ws_admin = bool(ctx.one("SELECT is_member('admins') AS a").get("a"))
+        lines.append(f"Workspace admin   : {'yes' if ws_admin else 'no'}")
+    except Exception:
+        lines.append("Workspace admin   : unknown")
+    ms_admin = None
+    w = ctx.w
+    if w is not None:
+        try:
+            owner = w.metastores.get(w.metastores.current().metastore_id).owner or ""
+            ms_admin = owner == ctx.runner or bool(ctx.one(
+                f"SELECT is_account_group_member('{owner.replace(chr(39), '')}') AS a").get("a"))
+            lines.append(f"Metastore admin   : {'yes' if ms_admin else 'no'} (owner: {owner})")
+        except Exception:
+            lines.append("Metastore admin   : unknown")
+    ids = identity_counts(ctx)
+    lines.append("Account directory : " + ("readable (OE-04-01 identity limits counted)"
+                 if ids else "not readable - OE-04-01 lists the user/group limits for "
+                 "manual confirmation"))
+    ok, denied, missing = [], [], []
+    for fqn, why in tables:
+        if ctx.has_table(fqn):
+            ok.append((fqn, why))
+        elif ctx.unreadable.get(fqn) == "denied":
+            denied.append((fqn, why))
+        else:
+            missing.append((fqn, why))
+    lines += ["", f"System tables readable: {len(ok)}/{len(tables)}"]
+    lines += [f"  [x] {fqn:<50} {why}" for fqn, why in ok]
+    lines += [f"  [!] {fqn:<50} {why} - missing grant" for fqn, why in denied]
+    lines += [f"  [ ] {fqn:<50} {why} - not found" for fqn, why in missing]
+    if denied:
+        schemas = sorted({f.rsplit(".", 1)[0] for f, _ in denied})
+        lines += ["", "Checks that need these tables will be manual-review with an [ACCESS] "
+                  "note. A metastore or account admin can grant them:",
+                  f"  GRANT USE CATALOG ON CATALOG system TO `{ctx.runner}`;"]
+        lines += [f"  GRANT USE SCHEMA, SELECT ON SCHEMA {s} TO `{ctx.runner}`;" for s in schemas]
+    if missing:
+        lines += ["", "Not found = the system schema is not enabled in this metastore (an "
+                  "account admin enables it) or the feature is not in use."]
+    if ms_admin is False:
+        lines += ["", "Not a metastore admin: information_schema shows only catalogs you "
+                  "have privileges on, so production-scoped checks cover just those."]
+    hidden = privilege_hidden_catalogs(ctx)
+    if hidden:
+        shown = ", ".join(hidden[:10]) + (", ..." if len(hidden) > 10 else "")
+        lines += ["", f"In-scope catalogs you cannot see ({len(hidden)}): {shown}",
+                  "Catalog-scoped checks will be manual-review with an [ACCESS] note. Grant "
+                  "BROWSE (or USE CATALOG/USE SCHEMA/SELECT) on them, or run as a "
+                  "metastore admin."]
+    return lines

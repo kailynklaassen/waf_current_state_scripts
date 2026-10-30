@@ -96,10 +96,13 @@ Rules applied consistently across all pillars:
   threshold.
 - **A check that errors reports `open`** with the error text, rather than aborting the
   pillar or silently passing.
-- **Unreadable evidence never scores `completed`.** A check distinguishes "we looked and
-  found nothing" from "we could not look" — the latter is `open` with a rationale naming
-  the unreadable source. A permanent test enforces this, because reporting a control as
-  satisfied when it was never checked is the worst failure this tool could have.
+- **Unreadable evidence never scores `completed` or `open`.** A check distinguishes "we
+  looked and found nothing" from "we could not look". When it could not read a table it
+  needs (a missing grant, or a system schema that is not enabled) it is `manual-review`
+  with an `[ACCESS: ...]` note naming the table, the runner and the GRANT to fix it.
+  Catalog-scoped checks are also `manual-review` when catalogs in the configured scope
+  exist that the runner has no privileges on, so a permissions gap is never reported as a
+  missing control.
 
 ### Questions that can't be automated
 
@@ -340,9 +343,13 @@ All 113 checks currently execute cleanly with 0 SQL failures.
 
 ## Requirements and permissions
 
-The assessor needs `SELECT` on the system schemas below. `00_config` prints exactly which
-are readable before you draw conclusions — a wall of `open` results usually means missing
-grants, not missing controls.
+The assessor needs `USE CATALOG` on `system` and `USE SCHEMA` + `SELECT` on the system
+schemas below. Being a workspace admin does not grant these - a metastore or account
+admin does. To see every production catalog, run as a metastore admin or hold `BROWSE`
+(or `USE CATALOG`/`USE SCHEMA`/`SELECT`) on them: `information_schema` only shows objects
+the runner has privileges on. `00_config` prints who is running, whether they are a
+workspace / metastore admin, which tables are readable, and the exact GRANTs that are
+missing; affected checks are `manual-review` with an `[ACCESS]` note.
 
 | Schema | Used for |
 | --- | --- |

@@ -121,17 +121,19 @@ class CliCtx(wc.Ctx):
         return self._w
 
     def has_table(self, fqn: str) -> bool:
-        if fqn in self._table_cache:
-            return self._table_cache[fqn]
-        try:
-            self.sql(f"SELECT 1 AS one FROM {fqn} LIMIT 1")
-            ok = True
-        except Exception:
+        if fqn not in self._table_cache:
             ok = False
-            if self.failures:
-                self.failures.pop()  # probing a missing table is not a code defect
-        self._table_cache[fqn] = ok
-        return ok
+            try:
+                self.sql(f"SELECT 1 AS one FROM {fqn} LIMIT 1")
+                ok = True
+            except Exception as exc:
+                self.unreadable[fqn] = wc.classify_table_error(str(exc))
+                if self.failures:
+                    self.failures.pop()  # probing a missing table is not a code defect
+            self._table_cache[fqn] = ok
+        if not self._table_cache[fqn] and fqn in self.unreadable:
+            self._check_unreadable[fqn] = self.unreadable[fqn]
+        return self._table_cache[fqn]
 
     def has_column(self, fqn: str, column: str) -> bool:
         key = f"{fqn}::{column}"
